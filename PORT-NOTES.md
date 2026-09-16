@@ -145,6 +145,9 @@ credentials, nothing left the machine):
   newest message). Turn 3 proves bob never sees alice's content.
 - **Two different tools in one turn**, each call correlated to exactly one
   result, no `tool-error`, and the file contents echoed back by the model.
+- **Caller-side tool execution**: a tool supplied via `session.tools` ran in
+  the test process (proven by echoing a per-process nonce back through the
+  model) while the agent ran on the app server.
 - **Three concurrent turns** on one provider instance: each returns its own
   sentinel and none contains another's.
 - **Streamed reasoning stays out of assistant text**, confirmed against a real
@@ -154,11 +157,12 @@ credentials, nothing left the machine):
 
 ## Known limitations
 
-- **Tool delegation is not implemented.** Letta agents run their own tools. AI
-  SDK tool definitions are warned about, not executed. Client-executed tools
-  are possible — `CreateSessionOptions.tools` takes `AgentTool[]` with a real
-  `execute` — but bridging that to the AI SDK's tool round-trip is a separate
-  piece of work.
+- **AI SDK `tools` are not translated into Letta tools.** Definitions passed
+  to `generateText`/`streamText` are warned about, not executed (register them
+  as placeholders so tool-call parts resolve — see above). Caller-side
+  execution itself *does* work: pass Letta `AgentTool`s through
+  `providerOptions.letta.session.tools` and they run in your process. What is
+  missing is only the automatic AI-SDK-shape → `AgentTool` conversion.
 - **Usage is unreported.** `SDKResultMessage` carries `durationMs` and
   `totalCostUsd` but no token counts, so usage fields are `undefined`
   (upstream hardcoded `-1`).

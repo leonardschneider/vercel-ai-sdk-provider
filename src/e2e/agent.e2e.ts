@@ -283,6 +283,74 @@ describe.skipIf(!configured)("letta provider e2e", () => {
   );
 
   it(
+    "executes a caller-supplied tool in this process",
+    async () => {
+      // A value only this process can know, so echoing it back proves the
+      // tool ran here and not on the app-server machine.
+      const localSecret = `pid-${process.pid}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      let executedLocally = false;
+
+      const whoAmI = {
+        label: "whoAmI",
+        name: "whoAmI",
+        description:
+          "Returns the caller's local identity token. Must be used to answer who the caller is.",
+        parameters: {
+          type: "object",
+          properties: { reason: { type: "string" } },
+        },
+        execute: async () => {
+          executedLocally = true;
+          return {
+            content: [{ type: "text", text: `caller-identity=${localSecret}` }],
+            isError: false,
+          };
+        },
+      };
+
+      const conversationId = await freshConversation("e2e-delegation");
+      const { stream } = await letta().doStream({
+        prompt: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Call the whoAmI tool and report the caller-identity value verbatim.",
+              },
+            ],
+          },
+        ],
+        providerOptions: {
+          letta: {
+            agent: { id: AGENT_ID as string, conversationId },
+            session: {
+              tools: [whoAmI],
+              allowedTools: ["whoAmI"],
+              permissionMode: "unrestricted",
+            },
+          },
+        },
+      } as never);
+
+      let text = "";
+      const reader = stream.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const part = value as { type: string; delta?: string };
+        if (part.type === "text-delta") text += part.delta ?? "";
+      }
+
+      expect(executedLocally).toBe(true);
+      expect(text).toContain(localSecret);
+    },
+    TIMEOUT,
+  );
+
+  it(
     "serves concurrent turns on one provider instance",
     async () => {
       const cases = [
