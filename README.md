@@ -213,33 +213,32 @@ Omit it to use the agent's default conversation.
 
 #### Tool calls
 
-Letta agents run their own tools. Two things follow:
+Letta agents run their own tools. The provider reports each call the agent
+makes as a **provider-executed** tool call (`providerExecuted: true`), so you
+do **not** need to register anything with the AI SDK — `tool-call` and
+`tool-result` parts appear in the stream, `generateText` returns them in
+`toolCalls`/`toolResults`, and the AI SDK will neither look them up, execute
+them, nor wait for a client result. `tool()` remains available purely as a
+typing convenience for callers who want typed tool parts.
 
-1. **Register placeholders** so the AI SDK recognises the tool-call parts the
-   provider emits, otherwise it raises `AI_NoSuchToolError`:
+One thing you must set: a **permission mode**. The default asks a human to
+approve tool calls, and a provider has no approver attached, so tool-using
+turns fail with `approval_conflict`:
 
-   ```typescript
-   tools: { TaskList: letta.tool('TaskList', { description: 'List tasks' }) },
-   ```
+```typescript
+providerOptions: {
+  letta: {
+    agent: { id: 'agent-...' },
+    session: { permissionMode: 'unrestricted', allowedTools: ['TaskList'] },
+  },
+}
+```
 
-   `tool()` has no default `execute` — adding one makes the AI SDK run the
-   placeholder and emit a second, meaningless tool result.
+`unrestricted` runs server-side tools (including `Bash`) without prompting;
+scope the toolset with `allowedTools` accordingly.
 
-2. **Set a permission mode.** The default asks a human to approve tool calls,
-   and a provider has no approver attached, so tool-using turns fail with
-   `approval_conflict`:
-
-   ```typescript
-   providerOptions: {
-     letta: {
-       agent: { id: 'agent-...' },
-       session: { permissionMode: 'unrestricted', allowedTools: ['TaskList'] },
-     },
-   }
-   ```
-
-   `unrestricted` runs server-side tools (including `Bash`) without prompting;
-   scope the toolset with `allowedTools` accordingly.
+To run a tool in **your own process** (for example with the end user's
+credentials), pass Letta `AgentTool`s through `session.tools`.
 
 #### Custom configuration
 
@@ -684,7 +683,7 @@ See guide [here](https://docs.letta.com/guides/agents/filesystem).
 
 Once tools are configured on your agent, they work seamlessly with both streaming and non-streaming. Tool calls are handled automatically by Letta, so you don't need to define or execute tool functions in your AI SDK code.
 
-However, the Vercel AI SDK requires tool definitions in the configuration to prevent errors. The Letta provider includes helper functions to create tool placeholders:
+Tool calls the agent makes are reported as provider-executed, so the AI SDK needs no tool definitions to accept them. If you want typed tool parts in your code, the provider includes a helper to create typed placeholders:
 
 ```typescript
 import { lettaCloud } from '@letta-ai/vercel-ai-sdk-provider';
@@ -699,7 +698,7 @@ const streamResult = streamText({
     memory_insert: lettaCloud.tool("memory_insert"),
     analytics: lettaCloud.tool("analytics"),
 
-    // Optionally provide description and schema (placeholders only - execution handled by Letta)
+    // Typing only - execution is handled by Letta, and registration is optional
     structured_tool: lettaCloud.tool("structured_tool", {
       description: "A tool with typed inputs",
       inputSchema: z.object({
@@ -727,7 +726,7 @@ const generateResult = await generateText({
     database_query: lettaCloud.tool("database_query"),
     my_custom_tool: lettaCloud.tool("my_custom_tool"),
 
-    // Optionally provide description and schema (placeholders only - execution handled by Letta)
+    // Typing only - execution is handled by Letta, and registration is optional
     typed_query: lettaCloud.tool("typed_query", {
       description: "Query with typed parameters",
       inputSchema: z.object({
@@ -744,7 +743,7 @@ const generateResult = await generateText({
 });
 ```
 
-**Note**: The actual tool execution happens in Letta - these tool configurations are placeholders required by the AI SDK to prevent runtime errors. The tool names should match the tools configured on your Letta agent. You can optionally provide descriptions and input schemas for better code documentation, but they are not required for functionality.
+**Note**: The actual tool execution happens in Letta, and the provider marks those calls `providerExecuted`, so registering them is **optional** — it only adds typing for consumers of the stream. Tool names should match the tools configured on your Letta agent.
 
 #### Accessing Tool Calls
 

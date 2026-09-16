@@ -15,7 +15,7 @@
  * or similar). Tool coverage is pinned to read-only tools.
  */
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { streamText } from "ai";
+import { generateText, stepCountIs, streamText } from "ai";
 import WebSocketImpl from "ws";
 import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -225,6 +225,175 @@ describe.skipIf(!configured)("letta provider e2e", () => {
       expect(types.filter((t) => t === "tool-result")).toHaveLength(1);
       expect(types).not.toContain("tool-error");
       expect(types).not.toContain("error");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "reports agent tool calls as provider-executed with NO tools registered",
+    async () => {
+      // Fix #1: no placeholders. The AI SDK must accept the tool-call because
+      // it is flagged providerExecuted + dynamic, not because it was declared.
+      const conversationId = await freshConversation("e2e-provexec");
+      const res = streamText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId, {
+          permissionMode: "unrestricted",
+        }),
+        prompt: "Use the TaskList tool, then say how many tasks there are.",
+      });
+
+      const types: string[] = [];
+      let toolName = "";
+      for await (const part of res.fullStream) {
+        types.push(part.type);
+        if (part.type === "tool-result") toolName = (part as any).toolName;
+      }
+
+      expect(types).toContain("tool-call");
+      expect(types.filter((t) => t === "tool-result")).toHaveLength(1);
+      expect(types).not.toContain("tool-error");
+      expect(types).not.toContain("error");
+      // Fix for the empty-toolName defect: the result carries the call's name.
+      expect(toolName).toBe("TaskList");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "joins streamed chunks into one block per message, not one per token",
+    async () => {
+      // Fix #2: before, a single reply produced ~14 text-start parts.
+      const conversationId = await freshConversation("e2e-blocks");
+      const { stream } = await letta().doStream({
+        prompt: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Write two short sentences about the sea.",
+              },
+            ],
+          },
+        ],
+        providerOptions: providerOptions(conversationId),
+      } as never);
+
+      let starts = 0;
+      let deltas = 0;
+      let ends = 0;
+      const reader = stream.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const t = (value as { type: string }).type;
+        if (t === "text-start") starts++;
+        if (t === "text-delta") deltas++;
+        if (t === "text-end") ends++;
+      }
+
+      expect(starts).toBe(ends);
+      expect(deltas).toBeGreaterThan(1); // it really was streamed in chunks
+      expect(starts).toBeLessThanOrEqual(3); // ...but joined into few blocks
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "generateText returns tool results and its messages feed back cleanly",
+    async () => {
+      // Fix #5 (doGenerate dropped tool-result) and fix #1 together: the
+      // documented multi-turn pattern must not throw MissingToolResultsError.
+      const conversationId = await freshConversation("e2e-feedback");
+      const first = await generateText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId, {
+          permissionMode: "unrestricted",
+        }),
+        prompt: "Use the TaskList tool, then say how many tasks there are.",
+      });
+
+      expect(first.toolCalls.length).toBeGreaterThan(0);
+      expect(first.toolResults.length).toBe(first.toolCalls.length);
+
+      const second = await generateText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId),
+        messages: [
+          { role: "user", content: "Use the TaskList tool." },
+          ...first.response.messages,
+          { role: "user", content: "Reply with exactly: FEEDBACK-OK." },
+        ],
+      });
+      expect(second.text).toContain("FEEDBACK-OK");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a multi-step stop condition does not re-run the same turn",
+    async () => {
+      // Fix #3: with provider-executed tools the AI SDK must not start a
+      // second step that would resend the original user message.
+      const conversationId = await freshConversation("e2e-steps");
+      const res = await generateText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId, {
+          permissionMode: "unrestricted",
+        }),
+        prompt: "Use the TaskList tool once, then say how many tasks there are.",
+        stopWhen: stepCountIs(4),
+      });
+
+      expect(res.steps).toHaveLength(1);
+      expect(res.toolCalls).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "aborting mid-turn is a clean cancellation, not an error",
+    async () => {
+      // Fix #4: abort must reach the agent (session brought up first) and be
+      // reported as finishReason "other" with no error part.
+      const conversationId = await freshConversation("e2e-abort");
+      const controller = new AbortController();
+      const { stream } = await letta().doStream({
+        prompt: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Count slowly from 1 to 200, one number per line.",
+              },
+            ],
+          },
+        ],
+        providerOptions: providerOptions(conversationId),
+        abortSignal: controller.signal,
+      } as never);
+
+      const parts: Array<{ type: string; finishReason?: string }> = [];
+      const reader = stream.getReader();
+      // Read until real content has started, so send() has happened.
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        parts.push(value as { type: string });
+        if ((value as { type: string }).type === "text-delta") break;
+      }
+      controller.abort();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        parts.push(value as { type: string; finishReason?: string });
+      }
+
+      expect(parts.some((p) => p.type === "error")).toBe(false);
+      const finish = parts.find((p) => p.type === "finish");
+      expect(finish?.finishReason).toBe("other");
     },
     TIMEOUT,
   );

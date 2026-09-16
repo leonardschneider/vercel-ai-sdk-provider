@@ -10,7 +10,6 @@ import {
 import {
   LettaAgentClient,
   extractStreamTextDelta,
-  type LettaCodeSession,
   type LettaCodeClientSessionOptions,
   type SDKMessage,
 } from "@letta-ai/letta-agent-sdk";
@@ -36,6 +35,14 @@ export interface LettaProviderOptions {
   };
 }
 
+type TurnArgs = {
+  agentId: string;
+  conversationId?: string;
+  sessionOptions?: LettaCodeClientSessionOptions;
+  message: ReturnType<typeof convertToLettaMessage>;
+  warnings: LanguageModelV2CallWarning[];
+};
+
 const UNKNOWN_USAGE: LanguageModelV2Usage = {
   inputTokens: undefined,
   outputTokens: undefined,
@@ -50,10 +57,13 @@ const UNKNOWN_USAGE: LanguageModelV2Usage = {
  */
 function explainError(
   raw: string,
-  message: { approvalConflict?: boolean },
+  message: { approvalConflict?: boolean; errorCode?: string },
 ): string {
   const isApproval =
-    message.approvalConflict === true || /approval_conflict/i.test(raw);
+    message.approvalConflict === true ||
+    message.errorCode === "approval_conflict" ||
+    message.errorCode === "approval_conflict_terminal" ||
+    /approval_conflict/i.test(raw);
   if (!isApproval) return raw;
   return (
     `${raw}: the agent tried to call a tool but no approver is attached to ` +
@@ -69,24 +79,23 @@ function mapStopReason(
 ): LanguageModelV2FinishReason {
   if (!success) return "error";
   switch (stopReason) {
-    case "end_turn":
-    case "stop":
-    case undefined:
-      return "stop";
-    case "max_steps":
-    case "max_tokens":
-    case "length":
-      return "length";
-    case "tool_use":
     case "requires_approval":
       return "tool-calls";
-    case "cancelled":
-    case "aborted":
-      return "other";
+    // "end_turn", "tool_rule" and undefined are all normal completions.
     default:
       return "stop";
   }
 }
+
+/**
+ * The agent SDK emits one `assistant`/`reasoning` SDKMessage per streamed
+ * chunk. Each chunk has its own uuid, but every chunk of one logical message
+ * shares an otid, and content is per-chunk, not cumulative. So a block is
+ * keyed by (kind, otid) and chunks append to it; a new otid or a different
+ * kind starts a new block.
+ */
+type BlockKind = "text" | "reasoning";
+type Block = { kind: BlockKind; id: string };
 
 export class LettaChatModel implements LanguageModelV2 {
   readonly specificationVersion = "v2" as const;
@@ -100,7 +109,7 @@ export class LettaChatModel implements LanguageModelV2 {
     this.client = client;
   }
 
-  private getArgs(options: LanguageModelV2CallOptions) {
+  private getArgs(options: LanguageModelV2CallOptions): TurnArgs {
     const warnings: LanguageModelV2CallWarning[] = [];
 
     const letta = (
@@ -117,18 +126,18 @@ export class LettaChatModel implements LanguageModelV2 {
       );
     }
 
-    // A Letta agent owns its toolset; tools supplied through the AI SDK call
-    // are not silently executed. Surface that rather than dropping it quietly.
+    // A Letta agent owns its toolset. Tool definitions passed through the AI
+    // SDK call are not sent to the agent; tool calls the agent makes are
+    // reported as provider-executed, so nothing needs registering here.
     if (options.tools && options.tools.length > 0) {
       warnings.push({
         type: "unsupported-setting",
         setting: "tools",
         details:
-          "Letta agents execute their own tools, so these definitions are not " +
-          "invoked. Registering them as placeholders (no `execute`) is still " +
-          "recommended so the AI SDK recognises tool-call parts instead of " +
-          "raising AI_NoSuchToolError. For tools that should run in your own " +
-          "process, use providerOptions.letta.session.tools.",
+          "Letta agents execute their own tools; AI SDK tool definitions are " +
+          "not sent to the agent. Tool calls it makes are reported as " +
+          "provider-executed. For tools that should run in your own process, " +
+          "use providerOptions.letta.session.tools.",
       });
     }
     for (const setting of ["temperature", "topP", "topK", "seed"] as const) {
@@ -150,7 +159,7 @@ export class LettaChatModel implements LanguageModelV2 {
     };
   }
 
-  private openSession(args: ReturnType<LettaChatModel["getArgs"]>) {
+  private openSession(args: TurnArgs) {
     // resumeSession(agentId) continues the agent's default conversation;
     // resumeSession(conversationId) continues that specific one.
     return this.client.resumeSession(
@@ -162,110 +171,73 @@ export class LettaChatModel implements LanguageModelV2 {
   /**
    * One turn, mapped from SDKMessage events to AI SDK stream parts.
    * Shared by doStream and doGenerate so both agree on semantics.
+   *
+   * `abort` is the provider's own controller: the caller's abortSignal is
+   * chained into it, and doStream's cancel() fires it too, so both paths stop
+   * the agent server-side rather than merely stopping us reading.
    */
   private async *runTurn(
-    args: ReturnType<LettaChatModel["getArgs"]>,
-    abortSignal?: AbortSignal,
+    args: TurnArgs,
+    abort: AbortController,
   ): AsyncGenerator<LanguageModelV2StreamPart> {
-    const session: LettaCodeSession = this.openSession(args);
-
-    // Without this the caller aborting only stops us reading: the agent keeps
-    // running the turn server-side and burning tokens. Tell it to stop.
-    let onAbort: (() => void) | undefined;
-    if (abortSignal) {
-      onAbort = () => {
-        void session.abort().catch(() => {
-          /* the turn may already be finished */
-        });
-      };
-      if (abortSignal.aborted) onAbort();
-      else abortSignal.addEventListener("abort", onAbort, { once: true });
-    }
+    const session = this.openSession(args);
 
     let finishReason: LanguageModelV2FinishReason = "stop";
-    let usage: LanguageModelV2Usage = UNKNOWN_USAGE;
+    const usage: LanguageModelV2Usage = UNKNOWN_USAGE;
+    let errorEmitted = false;
 
-    // Content arrives twice over: as token deltas (stream_event) and again as
-    // a completed assistant/reasoning message. Track the open block and what
-    // it already emitted so the completed message does not duplicate it.
-    //
-    // stream_event deltas carry a `kind` telling assistant text apart from
-    // reasoning tokens; they must not be merged into one block.
-    type Block = { kind: "text" | "reasoning"; id: string; streamed: string };
-    // Held in a container: TypeScript does not track assignments made inside
-    // the closures below, so a bare `let` would narrow to `never` at each use.
-    const state: { block: Block | null } = { block: null };
+    let block: Block | null = null;
+    const toolNames = new Map<string, string>();
 
-    const closeBlock = (): LanguageModelV2StreamPart | null => {
-      const open = state.block;
-      if (!open) return null;
-      state.block = null;
-      return open.kind === "text"
-        ? ({ type: "text-end", id: open.id } as LanguageModelV2StreamPart)
-        : ({ type: "reasoning-end", id: open.id } as LanguageModelV2StreamPart);
+    const close = (): LanguageModelV2StreamPart | null => {
+      if (!block) return null;
+      const part = { type: `${block.kind}-end`, id: block.id };
+      block = null;
+      return part as LanguageModelV2StreamPart;
     };
 
-    const openBlock = (
-      kind: "text" | "reasoning",
+    /** Route a content chunk into the block keyed by (kind, id). */
+    function* content(
+      kind: BlockKind,
       id: string,
-    ): LanguageModelV2StreamPart => {
-      state.block = { kind, id, streamed: "" };
-      return kind === "text"
-        ? ({ type: "text-start", id } as LanguageModelV2StreamPart)
-        : ({ type: "reasoning-start", id } as LanguageModelV2StreamPart);
-    };
-
-    /** Append to the open block and produce its delta part. */
-    const appendDelta = (text: string): LanguageModelV2StreamPart => {
-      const open = state.block;
-      if (!open) {
-        throw new Error("internal: delta emitted with no open block");
-      }
-      open.streamed += text;
-      return open.kind === "text"
-        ? ({
-            type: "text-delta",
-            id: open.id,
-            delta: text,
-          } as LanguageModelV2StreamPart)
-        : ({
-            type: "reasoning-delta",
-            id: open.id,
-            delta: text,
-          } as LanguageModelV2StreamPart);
-    };
-
-    /** Ensure a block of `kind` is open, closing a different one first. */
-    function* ensureBlock(
-      kind: "text" | "reasoning",
-      id: string,
+      text: string,
     ): Generator<LanguageModelV2StreamPart> {
-      if (state.block && state.block.kind !== kind) {
-        const end = closeBlock();
+      if (!text) return;
+      if (block && (block.kind !== kind || block.id !== id)) {
+        const end = close();
         if (end) yield end;
       }
-      if (!state.block) yield openBlock(kind, id);
-    }
-
-    /** Emit `content` for a completed message, skipping what deltas covered. */
-    function* settle(
-      kind: "text" | "reasoning",
-      id: string,
-      content: string,
-    ): Generator<LanguageModelV2StreamPart> {
-      yield* ensureBlock(kind, id);
-      const already = state.block?.streamed ?? "";
-      if (content && content !== already) {
-        const remainder = content.startsWith(already)
-          ? content.slice(already.length)
-          : content;
-        if (remainder) yield appendDelta(remainder);
+      if (!block) {
+        block = { kind, id };
+        yield { type: `${kind}-start`, id } as LanguageModelV2StreamPart;
       }
-      const end = closeBlock();
-      if (end) yield end;
+      yield { type: `${kind}-delta`, id, delta: text } as LanguageModelV2StreamPart;
     }
 
-    try {
+    const onAbort = () => {
+      void session.abort().catch(() => {
+        /* the turn may already be finished */
+      });
+    };
+
+    // The turn body is its own generator so an early `return` (caller already
+    // gave up) still falls through to the `finish` part below.
+    const body = async function* (): AsyncGenerator<LanguageModelV2StreamPart> {
+      // Nothing to do if the caller already gave up: don't start a turn.
+      if (abort.signal.aborted) {
+        finishReason = "other";
+        return;
+      }
+
+      // abort() is a no-op until the session has initialised, and send() is
+      // what initialises it — so bring the runtime up first, then re-check.
+      await session.ready();
+      if (abort.signal.aborted) {
+        finishReason = "other";
+        return;
+      }
+      abort.signal.addEventListener("abort", onAbort, { once: true });
+
       await session.send(args.message);
 
       for await (const message of session.stream() as AsyncGenerator<SDKMessage>) {
@@ -273,47 +245,79 @@ export class LettaChatModel implements LanguageModelV2 {
           case "stream_event": {
             const delta = extractStreamTextDelta(message.event);
             if (delta?.text) {
-              const kind = delta.kind === "reasoning" ? "reasoning" : "text";
-              yield* ensureBlock(kind, message.uuid);
-              yield appendDelta(delta.text);
+              yield* content(
+                delta.kind === "reasoning" ? "reasoning" : "text",
+                message.uuid,
+                delta.text,
+              );
             }
             break;
           }
 
-          case "assistant": {
-            yield* settle("text", message.uuid, message.content ?? "");
+          // Every streamed chunk gets its own uuid, but all chunks of one
+          // logical message share an otid — that is the identity to key the
+          // block on. Fall back to uuid for the rare fragment without one.
+          case "assistant":
+            yield* content(
+              "text",
+              message.otid ?? message.uuid,
+              message.content ?? "",
+            );
             break;
-          }
 
-          case "reasoning": {
-            yield* settle("reasoning", message.uuid, message.content ?? "");
+          case "reasoning":
+            yield* content(
+              "reasoning",
+              message.otid ?? message.uuid,
+              message.content ?? "",
+            );
             break;
-          }
 
           case "tool_call": {
+            const end = close();
+            if (end) yield end;
+            toolNames.set(message.toolCallId, message.toolName);
+            // The agent runs this tool itself. Marking the call as
+            // provider-executed (and dynamic, since it is not in the caller's
+            // toolset) tells the AI SDK not to look it up, execute it, or
+            // wait for a client result.
             yield {
               type: "tool-call",
               toolCallId: message.toolCallId,
               toolName: message.toolName,
               input:
                 message.rawArguments ?? JSON.stringify(message.toolInput ?? {}),
-            };
+              providerExecuted: true,
+              dynamic: true,
+            } as LanguageModelV2StreamPart;
             break;
           }
 
           case "tool_result": {
+            const end = close();
+            if (end) yield end;
             yield {
               type: "tool-result",
               toolCallId: message.toolCallId,
-              toolName: "",
+              toolName: toolNames.get(message.toolCallId) ?? "",
               result: message.content,
               isError: message.isError,
+              providerExecuted: true,
+              dynamic: true,
             } as LanguageModelV2StreamPart;
             break;
           }
 
           case "error": {
+            const end = close();
+            if (end) yield end;
+            if (abort.signal.aborted) {
+              // Our own abort: report a cancellation, not a failure.
+              finishReason = "other";
+              break;
+            }
             finishReason = "error";
+            errorEmitted = true;
             yield {
               type: "error",
               error: new Error(explainError(message.message, message)),
@@ -322,8 +326,17 @@ export class LettaChatModel implements LanguageModelV2 {
           }
 
           case "result": {
+            const end = close();
+            if (end) yield end;
+            if (abort.signal.aborted || message.errorCode === "interrupted") {
+              finishReason = "other";
+              break;
+            }
             finishReason = mapStopReason(message.stopReason, message.success);
-            if (!message.success && message.error) {
+            // The SDK sends an `error` message and then a failing `result`
+            // for the same failure; report it once.
+            if (!message.success && message.error && !errorEmitted) {
+              errorEmitted = true;
               yield {
                 type: "error",
                 error: new Error(explainError(message.error, message)),
@@ -337,37 +350,59 @@ export class LettaChatModel implements LanguageModelV2 {
         }
       }
 
-      const dangling = closeBlock();
+      const dangling = close();
       if (dangling) yield dangling;
+    };
+
+    try {
+      yield* body();
     } finally {
-      if (abortSignal && onAbort) {
-        abortSignal.removeEventListener("abort", onAbort);
-      }
-      await session[Symbol.asyncDispose]?.();
+      abort.signal.removeEventListener("abort", onAbort);
+      await session[Symbol.asyncDispose]();
     }
 
     yield { type: "finish", finishReason, usage };
   }
 
+  /** Chain the caller's signal into a controller the provider owns. */
+  private static controllerFor(signal?: AbortSignal): AbortController {
+    const controller = new AbortController();
+    if (signal) {
+      if (signal.aborted) controller.abort(signal.reason);
+      else
+        signal.addEventListener(
+          "abort",
+          () => controller.abort(signal.reason),
+          { once: true },
+        );
+    }
+    return controller;
+  }
+
   async doGenerate(options: LanguageModelV2CallOptions) {
     const args = this.getArgs(options);
+    const abort = LettaChatModel.controllerFor(options.abortSignal);
 
     const content: LanguageModelV2Content[] = [];
     let finishReason: LanguageModelV2FinishReason = "stop";
     let usage: LanguageModelV2Usage = UNKNOWN_USAGE;
-    let text = "";
+    let buffer = "";
 
-    for await (const part of this.runTurn(args, options.abortSignal)) {
+    for await (const part of this.runTurn(args, abort)) {
       switch (part.type) {
         case "text-delta":
-          text += part.delta;
+        case "reasoning-delta":
+          buffer += part.delta;
           break;
         case "text-end":
-          if (text) content.push({ type: "text", text });
-          text = "";
-          break;
-        case "reasoning-delta":
-          content.push({ type: "reasoning", text: part.delta });
+        case "reasoning-end":
+          if (buffer) {
+            content.push({
+              type: part.type === "text-end" ? "text" : "reasoning",
+              text: buffer,
+            });
+          }
+          buffer = "";
           break;
         case "tool-call":
           content.push({
@@ -375,6 +410,17 @@ export class LettaChatModel implements LanguageModelV2 {
             toolCallId: part.toolCallId,
             toolName: part.toolName,
             input: part.input,
+            providerExecuted: true,
+          });
+          break;
+        case "tool-result":
+          content.push({
+            type: "tool-result",
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            result: part.result,
+            isError: part.isError,
+            providerExecuted: true,
           });
           break;
         case "finish":
@@ -385,8 +431,6 @@ export class LettaChatModel implements LanguageModelV2 {
           break;
       }
     }
-
-    if (text) content.push({ type: "text", text });
 
     return {
       content,
@@ -399,10 +443,11 @@ export class LettaChatModel implements LanguageModelV2 {
 
   async doStream(options: LanguageModelV2CallOptions) {
     const args = this.getArgs(options);
-    const turn = this.runTurn(args, options.abortSignal);
+    const abort = LettaChatModel.controllerFor(options.abortSignal);
+    const turn = this.runTurn(args, abort);
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
-      async start(controller) {
+      start(controller) {
         controller.enqueue({ type: "stream-start", warnings: args.warnings });
       },
       async pull(controller) {
@@ -422,7 +467,11 @@ export class LettaChatModel implements LanguageModelV2 {
         }
       },
       async cancel() {
-        await turn.return(undefined as never);
+        // Stop the agent server-side, not just our reading of it. The
+        // listener in runTurn turns this into session.abort(), and the
+        // pending next() then resolves so the generator can wind down.
+        abort.abort();
+        await turn.return(undefined);
       },
     });
 

@@ -25,7 +25,7 @@ backend for exactly this.
 | File | Change |
 |---|---|
 | `letta-provider.ts` | `LettaClient` → `LettaAgentClient`; added `lettaRemote({url, authToken})`; `lettaLocal` now means `backend: "local"` (was the dead `localhost:8283`) |
-| `letta-chat.ts` | `agents.messages.create/createStream` → `resumeSession()` + `send()` + `stream()`; maps `SDKMessage` variants to AI SDK stream parts; shared `runTurn` so generate and stream agree |
+| `letta-chat.ts` | `agents.messages.create/createStream` → `resumeSession()` + `send()` + `stream()`; maps `SDKMessage` variants to AI SDK stream parts (tool parts provider-executed, blocks keyed by otid); shared `runTurn` so generate and stream agree; abort/cancel reach the agent |
 | `convert-to-letta-message.ts` | `MessageCreate[]` → `SendMessage` (sends only the newest user message; the transcript lives server-side) |
 | `convert-to-ai-sdk-message.ts` | `LettaMessageUnion` → `SDKMessage`; tool results now upgrade their matching call part by `toolCallId` |
 | `package.json` | dep `@letta-ai/letta-client` → `@letta-ai/letta-agent-sdk`; peer `ai` widened to `>=5.0.89 <8` |
@@ -89,20 +89,31 @@ The provider rewrites that error to say so rather than surfacing the bare code.
 Note `unrestricted` means server-side tools (including `Bash`) run without
 prompting — scope the agent's toolset accordingly.
 
-## Register agent tools as placeholders
+## Tool calls are provider-executed
 
-The provider emits `tool-call` parts for tools the Letta agent runs server-side.
-The AI SDK validates those against the caller's toolset, so with no tools
-registered it raises `AI_NoSuchToolError` and emits a spurious `tool-error`
-beside a tool call that actually succeeded. Register placeholders:
+Tool calls the agent makes are emitted with `providerExecuted: true` and
+`dynamic: true`. That is what tells the AI SDK not to look the tool up in the
+caller's toolset (no `AI_NoSuchToolError`), not to execute it locally, and not
+to start a second step waiting for a client result. Nothing needs registering;
+`tool()` is kept only as a typing convenience.
 
-```ts
-tools: { TaskList: letta.tool("TaskList", { description: "List tasks" }) },
-```
+## Streaming model
 
-`tool()` deliberately has **no default `execute`**. Upstream defaulted one that
-returned `"Handled by Letta"`, which made the AI SDK run the placeholder and
-emit a *second*, meaningless `tool-result` next to the real one.
+The SDK emits one `assistant`/`reasoning` SDKMessage per streamed chunk. A wire
+probe showed each chunk has its own `uuid` but all chunks of a logical message
+share an `otid`, with per-chunk (not cumulative) content. Blocks are therefore
+keyed by `(kind, otid)` and chunks append; a different otid or kind starts a
+new block. There is no delta-vs-completed-message dedup: this SDK sends one or
+the other, never both for the same content.
+
+## Abort and cancel
+
+The caller's `abortSignal` is chained into a provider-owned `AbortController`
+that `doStream`'s `cancel()` also fires, so both paths stop the agent
+server-side. Because `session.abort()` is a no-op until the session has
+initialised, the provider calls `session.ready()` before registering the
+listener; an already-aborted signal starts no turn at all. An abort that lands
+is reported as `finishReason: "other"` with no error part.
 
 ## Verified
 
@@ -158,8 +169,8 @@ credentials, nothing left the machine):
 ## Known limitations
 
 - **AI SDK `tools` are not translated into Letta tools.** Definitions passed
-  to `generateText`/`streamText` are warned about, not executed (register them
-  as placeholders so tool-call parts resolve — see above). Caller-side
+  to `generateText`/`streamText` are warned about, not executed; nothing needs
+  registering, since the agent's calls are provider-executed. Caller-side
   execution itself *does* work: pass Letta `AgentTool`s through
   `providerOptions.letta.session.tools` and they run in your process. What is
   missing is only the automatic AI-SDK-shape → `AgentTool` conversion.
@@ -167,8 +178,6 @@ credentials, nothing left the machine):
   `totalCostUsd` but no token counts, so usage fields are `undefined`
   (upstream hardcoded `-1`).
 - Upstream's REST-era e2e tests were removed rather than ported.
-- `tool_result` stream parts are emitted with an empty `toolName` (the SDK's
-  `tool_result` message does not carry the name; correlate by `toolCallId`).
 - `loop_status` and `queue_update` messages are ignored rather than surfaced.
 - `lint` and `prettier-check` remain broken upstream — neither eslint nor
   prettier is a devDependency. Left alone as out of scope.
