@@ -384,6 +384,264 @@ describe("LettaChatModel — reasoning and tools", () => {
   });
 });
 
+describe("LettaChatModel — multi-tool turns", () => {
+  test("maps two tool calls and correlates each result", async () => {
+    const { client } = fakeClient([
+      { type: "assistant", content: "Let me check both.", uuid: "a1" },
+      {
+        type: "tool_call",
+        toolCallId: "tc1",
+        toolName: "alpha",
+        toolInput: { n: 1 },
+        uuid: "u1",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "tc1",
+        content: "A",
+        isError: false,
+        uuid: "u2",
+      },
+      {
+        type: "tool_call",
+        toolCallId: "tc2",
+        toolName: "beta",
+        toolInput: { n: 2 },
+        uuid: "u3",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "tc2",
+        content: "B",
+        isError: false,
+        uuid: "u4",
+      },
+      { type: "assistant", content: "Both done.", uuid: "a2" },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+
+    const calls = parts.filter((p) => p.type === "tool-call");
+    const results = parts.filter((p) => p.type === "tool-result");
+    expect(calls.map((c) => c.toolName)).toEqual(["alpha", "beta"]);
+    expect(calls.map((c) => c.toolCallId)).toEqual(["tc1", "tc2"]);
+    expect(results.map((r) => r.toolCallId)).toEqual(["tc1", "tc2"]);
+    expect(results.map((r) => r.result)).toEqual(["A", "B"]);
+    expect(textOf(parts)).toBe("Let me check both.Both done.");
+  });
+
+  test("handles both tool calls arriving before either result", async () => {
+    const { client } = fakeClient([
+      {
+        type: "tool_call",
+        toolCallId: "p1",
+        toolName: "alpha",
+        toolInput: {},
+        uuid: "u1",
+      },
+      {
+        type: "tool_call",
+        toolCallId: "p2",
+        toolName: "beta",
+        toolInput: {},
+        uuid: "u2",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "p2",
+        content: "second",
+        isError: false,
+        uuid: "u3",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "p1",
+        content: "first",
+        isError: false,
+        uuid: "u4",
+      },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+    const byId = Object.fromEntries(
+      parts
+        .filter((p) => p.type === "tool-result")
+        .map((p) => [p.toolCallId, p.result]),
+    );
+    // Out-of-order results must not be cross-wired.
+    expect(byId).toEqual({ p1: "first", p2: "second" });
+  });
+
+  test("a failing tool among several does not fail the others", async () => {
+    const { client } = fakeClient([
+      {
+        type: "tool_call",
+        toolCallId: "ok",
+        toolName: "alpha",
+        toolInput: {},
+        uuid: "u1",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "ok",
+        content: "fine",
+        isError: false,
+        uuid: "u2",
+      },
+      {
+        type: "tool_call",
+        toolCallId: "bad",
+        toolName: "beta",
+        toolInput: {},
+        uuid: "u3",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "bad",
+        content: "exploded",
+        isError: true,
+        uuid: "u4",
+      },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+    const results = parts.filter((p) => p.type === "tool-result");
+    expect(results.find((r) => r.toolCallId === "ok")!.isError).toBe(false);
+    expect(results.find((r) => r.toolCallId === "bad")!.isError).toBe(true);
+    expect(parts.find((p) => p.type === "finish")!.finishReason).toBe("stop");
+  });
+
+  test("interleaves reasoning, tools and text without unbalanced blocks", async () => {
+    const { client } = fakeClient([
+      { type: "reasoning", content: "plan", uuid: "r1" },
+      {
+        type: "tool_call",
+        toolCallId: "t1",
+        toolName: "alpha",
+        toolInput: {},
+        uuid: "u1",
+      },
+      {
+        type: "tool_result",
+        toolCallId: "t1",
+        content: "R",
+        isError: false,
+        uuid: "u2",
+      },
+      { type: "reasoning", content: "now answer", uuid: "r2" },
+      { type: "assistant", content: "done", uuid: "a1" },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+    const starts = parts.filter(
+      (p) => p.type.endsWith("-start") && p.type !== "stream-start",
+    ).length;
+    const ends = parts.filter((p) => p.type.endsWith("-end")).length;
+    expect(starts).toBe(ends);
+    expect(textOf(parts)).toBe("done");
+  });
+});
+
+describe("LettaChatModel — concurrency", () => {
+  test("two turns on one model instance do not share block state", async () => {
+    const sessionA = fakeSession([
+      { type: "stream_event", uuid: "a", event: { delta: { text: "AAA" } } },
+      { type: "assistant", content: "AAA", uuid: "a" },
+      { type: "result", success: true, durationMs: 1, conversationId: "ca" },
+    ]);
+    const sessionB = fakeSession([
+      { type: "stream_event", uuid: "b", event: { delta: { text: "BBB" } } },
+      { type: "assistant", content: "BBB", uuid: "b" },
+      { type: "result", success: true, durationMs: 1, conversationId: "cb" },
+    ]);
+    const client = {
+      resumeSession: vi.fn((id: string) =>
+        id === "conv-a" ? sessionA.session : sessionB.session,
+      ),
+    } as any;
+
+    const model = new LettaChatModel(client);
+    const [a, b] = await Promise.all([
+      collect(model, opts({}, { conversationId: "conv-a" })),
+      collect(model, opts({}, { conversationId: "conv-b" })),
+    ]);
+
+    expect(textOf(a)).toBe("AAA");
+    expect(textOf(b)).toBe("BBB");
+    expect(sessionA.disposed).toBe(1);
+    expect(sessionB.disposed).toBe(1);
+  });
+
+  test("concurrent turns each get their own session", async () => {
+    const seen: string[] = [];
+    const make = (tag: string) =>
+      fakeSession([
+        { type: "assistant", content: tag, uuid: tag },
+        { type: "result", success: true, durationMs: 1, conversationId: tag },
+      ]);
+    const sessions = new Map([
+      ["c1", make("one")],
+      ["c2", make("two")],
+      ["c3", make("three")],
+    ]);
+    const client = {
+      resumeSession: vi.fn((id: string) => {
+        seen.push(id);
+        return sessions.get(id)!.session;
+      }),
+    } as any;
+
+    const model = new LettaChatModel(client);
+    const results = await Promise.all(
+      ["c1", "c2", "c3"].map((id) =>
+        collect(model, opts({}, { conversationId: id })),
+      ),
+    );
+
+    expect(results.map(textOf)).toEqual(["one", "two", "three"]);
+    expect(seen.sort()).toEqual(["c1", "c2", "c3"]);
+    for (const s of sessions.values()) expect(s.disposed).toBe(1);
+  });
+});
+
+describe("LettaChatModel — non-content messages", () => {
+  test("ignores lifecycle chatter without emitting parts", async () => {
+    const { client } = fakeClient([
+      { type: "init" },
+      { type: "loop_status", status: "SENDING_API_REQUEST", activeRunIds: [] },
+      { type: "queue_update", queue: [] },
+      { type: "retry", attempt: 1 },
+      {
+        type: "loop_status",
+        status: "WAITING_ON_INPUT",
+        activeRunIds: [],
+      },
+      { type: "assistant", content: "hi", uuid: "u1" },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+    // Only the assistant text and the envelope should survive.
+    expect(parts.map((p) => p.type)).toEqual([
+      "stream-start",
+      "text-start",
+      "text-delta",
+      "text-end",
+      "finish",
+    ]);
+  });
+
+  test("tolerates an unknown future message type", async () => {
+    const { client } = fakeClient([
+      { type: "something_new_from_a_later_sdk", payload: 1 },
+      { type: "assistant", content: "still fine", uuid: "u1" },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+    expect(textOf(parts)).toBe("still fine");
+    expect(parts.find((p) => p.type === "finish")!.finishReason).toBe("stop");
+  });
+});
+
 describe("LettaChatModel — finish reasons and errors", () => {
   const cases: Array<[string | undefined, boolean, string]> = [
     ["end_turn", true, "stop"],

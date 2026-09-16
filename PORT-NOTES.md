@@ -143,6 +143,10 @@ credentials, nothing left the machine):
 
   Turn 2 proves server-side transcript accumulation (the client sent only the
   newest message). Turn 3 proves bob never sees alice's content.
+- **Two different tools in one turn**, each call correlated to exactly one
+  result, no `tool-error`, and the file contents echoed back by the model.
+- **Three concurrent turns** on one provider instance: each returns its own
+  sentinel and none contains another's.
 - **Streamed reasoning stays out of assistant text**, confirmed against a real
   reasoning model: 10 reasoning blocks and 14 text blocks in one turn, block
   starts equal to ends, and no reasoning prefix present in the text. This is
@@ -162,8 +166,5 @@ credentials, nothing left the machine):
 - `tool_result` stream parts are emitted with an empty `toolName` (the SDK's
   `tool_result` message does not carry the name; correlate by `toolCallId`).
 - `loop_status` and `queue_update` messages are ignored rather than surfaced.
-- Multi-tool planning (a model calling two tools in one turn) is still
-  unexercised; the tool coverage uses a single read-only tool.
-- Concurrent turns through one provider instance are untested.
 - `lint` and `prettier-check` remain broken upstream — neither eslint nor
   prettier is a devDependency. Left alone as out of scope.

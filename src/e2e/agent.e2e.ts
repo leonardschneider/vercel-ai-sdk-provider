@@ -17,6 +17,9 @@
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { streamText } from "ai";
 import WebSocketImpl from "ws";
+import { writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { lettaRemote, type LettaProvider } from "../index";
 
 const URL = process.env.LETTA_E2E_URL;
@@ -222,6 +225,94 @@ describe.skipIf(!configured)("letta provider e2e", () => {
       expect(types.filter((t) => t === "tool-result")).toHaveLength(1);
       expect(types).not.toContain("tool-error");
       expect(types).not.toContain("error");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "handles a turn that calls two different tools",
+    async () => {
+      // Read executes on the app-server machine, so point it at a file this
+      // test owns rather than anything pre-existing.
+      const probe = join(tmpdir(), `letta-e2e-probe-${Date.now()}.txt`);
+      writeFileSync(probe, "MULTITOOL-PROBE-8812\n");
+
+      try {
+        const conversationId = await freshConversation("e2e-multitool");
+        const res = streamText({
+          model: letta(),
+          providerOptions: providerOptions(conversationId, {
+            allowedTools: ["TaskList", "Read"],
+            permissionMode: "unrestricted",
+          }),
+          prompt:
+            `Do exactly two things, using a tool for each: ` +
+            `(1) call TaskList to list tasks; ` +
+            `(2) call Read on the file ${probe} and report the line it contains.`,
+          tools: {
+            TaskList: letta.tool("TaskList", { description: "List tasks" }),
+            Read: letta.tool("Read", { description: "Read a file" }),
+          },
+        });
+
+        const calls: string[] = [];
+        const resultIds: string[] = [];
+        const types: string[] = [];
+        let text = "";
+        for await (const part of res.fullStream) {
+          types.push(part.type);
+          if (part.type === "tool-call") calls.push((part as any).toolName);
+          if (part.type === "tool-result")
+            resultIds.push((part as any).toolCallId);
+          if (part.type === "text-delta")
+            text += (part as any).text ?? (part as any).delta ?? "";
+        }
+
+        expect(calls.length).toBeGreaterThanOrEqual(2);
+        expect(new Set(calls).size).toBeGreaterThanOrEqual(2);
+        // Every call must have exactly one correlated result.
+        expect(resultIds.length).toBe(calls.length);
+        expect(new Set(resultIds).size).toBe(resultIds.length);
+        expect(types).not.toContain("tool-error");
+        expect(text).toContain("MULTITOOL-PROBE-8812");
+      } finally {
+        rmSync(probe, { force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "serves concurrent turns on one provider instance",
+    async () => {
+      const cases = [
+        { conv: await freshConversation("e2e-conc-a"), token: "ALPHA-11" },
+        { conv: await freshConversation("e2e-conc-b"), token: "BRAVO-22" },
+        { conv: await freshConversation("e2e-conc-c"), token: "CHARLIE-33" },
+      ];
+
+      const answers = await Promise.all(
+        cases.map(async ({ conv, token }) => {
+          const res = streamText({
+            model: letta(),
+            providerOptions: providerOptions(conv),
+            prompt: `Reply with exactly: ${token}. Nothing else.`,
+          });
+          let out = "";
+          for await (const delta of res.textStream) out += delta;
+          return out;
+        }),
+      );
+
+      // Each turn gets its own answer, and no other turn's token bleeds in.
+      cases.forEach(({ token }, i) => {
+        expect(answers[i]).toContain(token);
+        cases
+          .filter((_, j) => j !== i)
+          .forEach(({ token: other }) => {
+            expect(answers[i]).not.toContain(other);
+          });
+      });
     },
     TIMEOUT,
   );
