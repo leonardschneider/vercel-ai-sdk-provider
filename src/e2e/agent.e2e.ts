@@ -26,6 +26,10 @@ const configured = Boolean(URL && AGENT_ID);
 
 const SAFE_TOOLS = ["TaskList"];
 const TIMEOUT = 120_000;
+// Override for the reasoning case; the agent's own model may not emit
+// reasoning tokens. Set LETTA_E2E_REASONING_MODEL to a provider/model handle.
+const REASONING_MODEL =
+  process.env.LETTA_E2E_REASONING_MODEL ?? "anthropic/claude-opus-4-8";
 
 describe.skipIf(!configured)("letta provider e2e", () => {
   let letta: LettaProvider;
@@ -138,6 +142,60 @@ describe.skipIf(!configured)("letta provider e2e", () => {
       for await (const delta of other.textStream) answer += delta;
 
       expect(answer).not.toContain("BANANA-31");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "keeps streamed reasoning out of the assistant text",
+    async () => {
+      const conversationId = await freshConversation("e2e-reasoning");
+      const { stream } = await letta().doStream({
+        prompt: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Think step by step: what is 17 * 23? Show your reasoning.",
+              },
+            ],
+          },
+        ],
+        providerOptions: {
+          letta: {
+            agent: { id: AGENT_ID as string, conversationId },
+            session: {
+              allowedTools: [],
+              model: REASONING_MODEL,
+              reasoningEffort: "medium",
+            },
+          },
+        },
+      } as never);
+
+      let reasoning = "";
+      let text = "";
+      let starts = 0;
+      let ends = 0;
+      const reader = stream.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const part = value as { type: string; delta?: string };
+        if (part.type === "reasoning-delta") reasoning += part.delta ?? "";
+        if (part.type === "text-delta") text += part.delta ?? "";
+        if (part.type.endsWith("-start") && part.type !== "stream-start")
+          starts++;
+        if (part.type.endsWith("-end")) ends++;
+      }
+
+      // The model must actually have produced reasoning for this to mean
+      // anything; skip the assertion rather than pass vacuously if it did not.
+      if (reasoning.length > 0) {
+        expect(text).not.toContain(reasoning.slice(0, 40));
+      }
+      expect(starts).toBe(ends);
     },
     TIMEOUT,
   );

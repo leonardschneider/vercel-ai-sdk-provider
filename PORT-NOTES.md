@@ -143,6 +143,10 @@ credentials, nothing left the machine):
 
   Turn 2 proves server-side transcript accumulation (the client sent only the
   newest message). Turn 3 proves bob never sees alice's content.
+- **Streamed reasoning stays out of assistant text**, confirmed against a real
+  reasoning model: 10 reasoning blocks and 14 text blocks in one turn, block
+  starts equal to ends, and no reasoning prefix present in the text. This is
+  the path the reasoning-leak bug lived on.
 
 ## Known limitations
 
@@ -158,8 +162,8 @@ credentials, nothing left the machine):
 - `tool_result` stream parts are emitted with an empty `toolName` (the SDK's
   `tool_result` message does not carry the name; correlate by `toolCallId`).
 - `loop_status` and `queue_update` messages are ignored rather than surfaced.
-- Multi-tool planning and a real model's reasoning-token stream are still
-  unexercised; the real-model run used a single read-only tool. The
-  reasoning/text split is covered by unit tests only.
+- Multi-tool planning (a model calling two tools in one turn) is still
+  unexercised; the tool coverage uses a single read-only tool.
+- Concurrent turns through one provider instance are untested.
 - `lint` and `prettier-check` remain broken upstream — neither eslint nor
   prettier is a devDependency. Left alone as out of scope.
