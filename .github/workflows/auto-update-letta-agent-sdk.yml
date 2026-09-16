@@ -1,4 +1,4 @@
-name: Auto-update @letta-ai/letta-client
+name: Auto-update @letta-ai/letta-agent-sdk
 
 on:
   schedule:
@@ -6,10 +6,10 @@ on:
   workflow_dispatch:  # Allow manual trigger
   push:
     paths:
-      - '.github/workflows/auto-update-letta-client.yml'
+      - '.github/workflows/auto-update-letta-agent-sdk.yml'
   pull_request:
       paths:
-          - '.github/workflows/auto-update-letta-client.yml'
+          - '.github/workflows/auto-update-letta-agent-sdk.yml'
 
 jobs:
   check-and-update:
@@ -30,19 +30,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
         
-      - name: Get current letta-client version
+      - name: Get current letta-agent-sdk version
         id: current-version
         run: |
-          CURRENT_VERSION=$(npm list @letta-ai/letta-client --depth=0 --json | jq -r '.dependencies["@letta-ai/letta-client"].version')
+          CURRENT_VERSION=$(npm list @letta-ai/letta-agent-sdk --depth=0 --json | jq -r '.dependencies["@letta-ai/letta-agent-sdk"].version')
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-          echo "Current @letta-ai/letta-client version: $CURRENT_VERSION"
+          echo "Current @letta-ai/letta-agent-sdk version: $CURRENT_VERSION"
           
-      - name: Get latest letta-client version
+      - name: Get latest letta-agent-sdk version
         id: latest-version
         run: |
-          LATEST_VERSION=$(npm view @letta-ai/letta-client version)
+          LATEST_VERSION=$(npm view @letta-ai/letta-agent-sdk version)
           echo "latest=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "Latest @letta-ai/letta-client version: $LATEST_VERSION"
+          echo "Latest @letta-ai/letta-agent-sdk version: $LATEST_VERSION"
           
       - name: Compare versions and update if needed
         id: update-check
@@ -52,7 +52,7 @@ jobs:
             echo "needs_update=true" >> $GITHUB_OUTPUT
             
             # Update the dependency
-            npm install @letta-ai/letta-client@${{ steps.latest-version.outputs.latest }}
+            npm install @letta-ai/letta-agent-sdk@${{ steps.latest-version.outputs.latest }}
             
             # Bump SDK version (patch)
             npm version patch --no-git-tag-version
@@ -81,9 +81,9 @@ jobs:
           git config --local user.name "GitHub Action"
           git add package.json package-lock.json
          
-          git commit -m "chore: update @letta-ai/letta-client to ${{ steps.latest-version.outputs.latest }} and bump SDK to ${{ steps.update-check.outputs.new_sdk_version }}
+          git commit -m "chore: update @letta-ai/letta-agent-sdk to ${{ steps.latest-version.outputs.latest }} and bump SDK to ${{ steps.update-check.outputs.new_sdk_version }}
 
-          🤖 Automatically updated @letta-ai/letta-client version"
+          🤖 Automatically updated @letta-ai/letta-agent-sdk version"
           
           npm version patch
 
@@ -103,7 +103,7 @@ jobs:
         run: |
           if [ "${{ steps.update-check.outputs.needs_update }}" == "true" ]; then
             echo "## ✅ Update Completed" >> $GITHUB_STEP_SUMMARY
-            echo "- Updated @letta-ai/letta-client from ${{ steps.current-version.outputs.current }} to ${{ steps.latest-version.outputs.latest }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Updated @letta-ai/letta-agent-sdk from ${{ steps.current-version.outputs.current }} to ${{ steps.latest-version.outputs.latest }}" >> $GITHUB_STEP_SUMMARY
             echo "- Bumped SDK version to ${{ steps.update-check.outputs.new_sdk_version }}" >> $GITHUB_STEP_SUMMARY
             echo "- Release workflow will trigger automatically from push to main" >> $GITHUB_STEP_SUMMARY
           else

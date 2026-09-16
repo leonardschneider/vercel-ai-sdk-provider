@@ -10,7 +10,7 @@ describe("letta-tools", () => {
 
         expect(toolResult).toHaveProperty("description");
         expect(toolResult).toHaveProperty("inputSchema");
-        expect(toolResult).toHaveProperty("execute");
+        expect(toolResult.execute).toBeUndefined();
         expect(toolResult.description).toBe("my_tool tool");
       });
 
@@ -36,17 +36,9 @@ describe("letta-tools", () => {
         expect(toolResult.inputSchema).toBe(schema);
       });
 
-      it("should execute function returning Letta handling message", async () => {
-        const toolResult = tool("my_tool");
-
-        expect(toolResult.execute).toBeDefined();
-        if (toolResult.execute) {
-          const result = await toolResult.execute(
-            {},
-            { toolCallId: "test-id", messages: [] },
-          );
-          expect(result).toBe("Handled by Letta");
-        }
+      it("has no default execute, so the AI SDK will not double-report a result", () => {
+        const toolResult = tool("test_tool");
+        expect(toolResult.execute).toBeUndefined();
       });
     });
 
@@ -104,27 +96,15 @@ describe("letta-tools", () => {
         expect(runCode.description).toBe("run_code tool");
       });
 
-      it("should have execute function returning Letta handling message", async () => {
-        const toolResult = tool("web_search");
-
+      it("keeps an explicitly supplied execute", async () => {
+        const toolResult = tool("test_tool", {
+          execute: async () => "mine",
+        } as any);
         expect(toolResult.execute).toBeDefined();
-        if (toolResult.execute) {
-          const result = await toolResult.execute(
-            {},
-            { toolCallId: "test-id", messages: [] },
-          );
-          expect(result).toBe("Handled by Letta");
-        }
-      });
-
-      it("should allow overriding default options", () => {
-        const toolResult = tool("web_search", {
-          description: "Custom description for web search",
+        const r = await (toolResult.execute as any)({}, {
+          toolCallId: "test-id", messages: [], context: {},
         });
-
-        expect(toolResult.description).toBe(
-          "Custom description for web search",
-        );
+        expect(r).toBe("mine");
       });
     });
   });

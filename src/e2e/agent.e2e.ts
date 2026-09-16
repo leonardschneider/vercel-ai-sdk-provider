@@ -1,590 +1,196 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import dotenv from "dotenv";
-import { generateText, streamText } from "ai";
-import {
-  newAgent,
-  newAgentDescription,
-  newAgentName,
-  newAgentProjectId,
-  testMessage,
-  testMessageWithAssistant,
-  testMessageWithSystemRole,
-  testMessageWithToolRole,
-  modelTestMessage,
-  modelTestMessageWithAssistantRole,
-  modelTestMessageWithSystemRole,
-  modelTestMessageWithNamedToolRole,
-} from "./const";
+/**
+ * End-to-end against a real Letta app server.
+ *
+ * Skips unless a server is configured, so CI stays green without credentials:
+ *
+ *   letta server --listen ws://127.0.0.1:4500 \
+ *     --ws-auth capability-token --ws-token-file /path/to/token
+ *
+ *   LETTA_E2E_URL=ws://127.0.0.1:4500 \
+ *   LETTA_E2E_TOKEN=$(cat /path/to/token) \
+ *   LETTA_E2E_AGENT_ID=agent-local-... \
+ *   npm run test:e2e
+ *
+ * The agent needs a working model provider (`letta connect anthropic-oauth`
+ * or similar). Tool coverage is pinned to read-only tools.
+ */
+import { describe, expect, it, beforeAll, afterAll } from "vitest";
+import { streamText } from "ai";
+import WebSocketImpl from "ws";
+import { lettaRemote, type LettaProvider } from "../index";
 
-dotenv.config();
+const URL = process.env.LETTA_E2E_URL;
+const TOKEN = process.env.LETTA_E2E_TOKEN;
+const AGENT_ID = process.env.LETTA_E2E_AGENT_ID;
+const configured = Boolean(URL && AGENT_ID);
 
-const { lettaCloud } = await import("../letta-provider");
+const SAFE_TOOLS = ["TaskList"];
+const TIMEOUT = 120_000;
 
-describe("e2e Letta Cloud", () => {
-  let serviceAvailable = false;
+describe.skipIf(!configured)("letta provider e2e", () => {
+  let letta: LettaProvider;
 
-  beforeAll(async () => {
-    try {
-      // Test if the Letta service is available
-      const list = await lettaCloud.client.agents.list({
-        name: newAgentName,
-        projectId: newAgentProjectId,
-      });
-      serviceAvailable = true;
-
-      // Clean up any existing test agents
-      if (list[0]) {
-        await lettaCloud.client.agents.delete(list[0].id);
-      }
-    } catch (error) {
-      console.warn("Letta service unavailable, skipping e2e tests:", error);
-      serviceAvailable = false;
-    }
+  beforeAll(() => {
+    letta = lettaRemote({
+      url: URL as string,
+      authToken: TOKEN,
+      // vitest's global WebSocket fails to connect; use the ws package.
+      WebSocket: WebSocketImpl as never,
+    });
   });
 
+  afterAll(async () => {
+    await (letta?.client as unknown as AsyncDisposable)?.[
+      Symbol.asyncDispose
+    ]?.();
+  });
+
+  async function freshConversation(name: string): Promise<string> {
+    const conv = await letta.client.conversations.create({
+      agentId: AGENT_ID as string,
+      description: `${name}-${Date.now()}`,
+    });
+    return conv.id;
+  }
+
+  function providerOptions(
+    conversationId: string,
+    session: Record<string, unknown> = {},
+  ) {
+    return {
+      letta: {
+        agent: { id: AGENT_ID as string, conversationId },
+        session: { allowedTools: SAFE_TOOLS, ...session },
+      },
+    };
+  }
+
   it(
-    "[generate] it should create an agent, chat with it and delete it",
-    {
-      timeout: 100_000, // 100 seconds
-    },
+    "streams text from a real model",
     async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
-      }
+      const conversationId = await freshConversation("e2e-text");
+      const res = streamText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId),
+        prompt: "Reply with exactly: E2E-OK. Nothing else.",
+      });
 
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
+      let text = "";
+      for await (const delta of res.textStream) text += delta;
 
-        let message;
-
-        // Type: User
-        message = await generateText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          messages: modelTestMessage,
-        });
-        expect(message.text).to.exist.and.not.contain('3:"An error occurred."');
-
-        // Type: System
-        message = await generateText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          messages: modelTestMessageWithSystemRole,
-        });
-        expect(message.text).to.exist.and.not.contain('3:"An error occurred."');
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
-      }
+      expect(text).toContain("E2E-OK");
+      expect(await res.finishReason).toBe("stop");
     },
+    TIMEOUT,
   );
 
   it(
-    "[stream] it should create an agent, chat with it and delete it",
-    {
-      timeout: 100_000, // 100 seconds
-    },
+    "keeps the transcript server-side across turns",
     async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
+      const conversationId = await freshConversation("e2e-memory");
+
+      const first = streamText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId),
+        prompt: "My favourite number is 4242. Acknowledge briefly.",
+      });
+      for await (const _ of first.textStream) {
+        /* drain */
       }
 
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
+      // Second turn sends ONLY the new message: recall proves the agent, not
+      // the client, is holding the transcript.
+      const second = streamText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId),
+        prompt: "What number did I tell you? Reply with only the number.",
+      });
+      let recalled = "";
+      for await (const delta of second.textStream) recalled += delta;
 
-        let result = "";
-
-        // Type: User - with error handling
-        try {
-          const { textStream: userTextStream } = streamText({
-            model: lettaCloud(),
-            providerOptions: {
-              letta: {
-                agent: { id: agent.id },
-              },
-            },
-            messages: modelTestMessage,
-          });
-          for await (const text of userTextStream) {
-            result += text;
-          }
-          expect(result).to.exist.and.not.contain('3:"An error occurred."');
-        } catch (streamError) {
-          console.warn("Stream test failed, but continuing:", streamError);
-          // For now, just verify we can create and delete agent
-          expect(agent.id).toBeDefined();
-        }
-
-        // Type: System - with error handling
-        try {
-          result = "";
-          const { textStream: systemTextStream } = streamText({
-            model: lettaCloud(),
-            providerOptions: {
-              letta: {
-                agent: { id: agent.id },
-              },
-            },
-            messages: modelTestMessageWithSystemRole,
-          });
-          for await (const text of systemTextStream) {
-            result += text;
-          }
-          expect(result).to.exist.and.not.contain('3:"An error occurred."');
-        } catch (streamError) {
-          console.warn(
-            "System stream test failed, but continuing:",
-            streamError,
-          );
-          // For now, just verify we can create and delete agent
-          expect(agent.id).toBeDefined();
-        }
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
-      }
+      expect(recalled).toContain("4242");
     },
+    TIMEOUT,
   );
 
   it(
-    "[stream with reasoning] it should stream reasoning and assistant messages correctly",
-    {
-      timeout: 60_000, // 60 seconds
-    },
+    "keeps conversations on one agent isolated",
     async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
+      const a = await freshConversation("e2e-iso-a");
+      const b = await freshConversation("e2e-iso-b");
+
+      const seed = streamText({
+        model: letta(),
+        providerOptions: providerOptions(a),
+        prompt: "Remember the codeword BANANA-31. Acknowledge briefly.",
+      });
+      for await (const _ of seed.textStream) {
+        /* drain */
       }
 
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
+      const other = streamText({
+        model: letta(),
+        providerOptions: providerOptions(b),
+        prompt:
+          "What codeword were you just told? If you were not told one, reply NONE.",
+      });
+      let answer = "";
+      for await (const delta of other.textStream) answer += delta;
 
-        // Test streaming with reasoning enabled
-        const result = streamText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: "Who are you? Please be brief.",
-                },
-              ],
-            },
-          ],
-        });
-
-        let textContent = "";
-        let reasoningContent = "";
-        let hasReasoningStart = false;
-        let hasReasoningEnd = false;
-        let hasTextStart = false;
-        let hasTextEnd = false;
-
-        try {
-          // Test the full stream response
-          const stream = result.fullStream;
-          for await (const part of stream) {
-            // Only log key events to reduce noise
-            if (
-              part.type.includes("reasoning") ||
-              part.type.includes("text") ||
-              part.type === "finish"
-            ) {
-              console.log(
-                "Stream part:",
-                part.type,
-                part.type.includes("delta")
-                  ? `${part.type}(${(part as any).text?.length || 0} chars)`
-                  : part.type,
-              );
-            }
-
-            switch (part.type) {
-              case "text-start":
-                hasTextStart = true;
-                expect(part.id).toBeDefined();
-                break;
-              case "text-delta":
-                const textDelta = (part as any).text;
-                if (textDelta) {
-                  textContent += textDelta;
-                }
-                expect(part.id).toBeDefined();
-                expect(textDelta).toBeDefined();
-                break;
-              case "text-end":
-                hasTextEnd = true;
-                expect(part.id).toBeDefined();
-                break;
-              case "reasoning-start":
-                hasReasoningStart = true;
-                expect(part.id).toBeDefined();
-                expect(part.id).toContain("reasoning-");
-                break;
-              case "reasoning-delta":
-                // Handle both delta and text properties (AI SDK might transform them)
-                const reasoningText = (part as any).text;
-                if (reasoningText) {
-                  reasoningContent += reasoningText;
-                }
-                expect(part.id).toBeDefined();
-                expect(part.id).toContain("reasoning-");
-                expect(reasoningText).toBeDefined();
-                break;
-              case "reasoning-end":
-                hasReasoningEnd = true;
-                expect(part.id).toBeDefined();
-                expect(part.id).toContain("reasoning-");
-                break;
-              case "tool-call":
-                // Tool calls might happen, just log them
-                console.log(
-                  "Tool call:",
-                  (part as any).toolName,
-                  (part as any).toolCallId,
-                );
-                break;
-              case "finish":
-                expect(part.finishReason).toBe("stop");
-                // Usage may not be available in all stream implementations
-                if ((part as any).usage) {
-                  expect((part as any).usage).toBeDefined();
-                }
-                break;
-            }
-          }
-
-          // Verify we got both text and reasoning streams
-          console.log("Text content length:", textContent.length);
-          console.log("Reasoning content length:", reasoningContent.length);
-          console.log(
-            "Stream events - Text start/end:",
-            hasTextStart,
-            hasTextEnd,
-          );
-          console.log(
-            "Stream events - Reasoning start/end:",
-            hasReasoningStart,
-            hasReasoningEnd,
-          );
-
-          // Basic assertions
-          expect(textContent).to.exist;
-          expect(textContent.length).toBeGreaterThan(0);
-          expect(textContent).not.toContain('3:"An error occurred."');
-
-          // If reasoning is present, verify the stream events
-          if (reasoningContent.length > 0) {
-            expect(hasReasoningStart).toBe(true);
-            expect(hasReasoningEnd).toBe(true);
-            expect(reasoningContent).not.toContain('3:"An error occurred."');
-          }
-
-          // Verify text stream events
-          expect(hasTextStart).toBe(true);
-          expect(hasTextEnd).toBe(true);
-        } catch (streamError) {
-          console.warn(
-            "Stream with reasoning test failed, but continuing:",
-            streamError,
-          );
-          // For now, just verify we can create and delete agent
-          expect(agent.id).toBeDefined();
-        }
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
-      }
+      expect(answer).not.toContain("BANANA-31");
     },
+    TIMEOUT,
   );
 
   it(
-    "[generate with reasoning] it should handle reasoning in generate mode",
-    {
-      timeout: 60_000, // 60 seconds
-    },
+    "surfaces a tool call and its result without a spurious tool-error",
     async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
-      }
+      const conversationId = await freshConversation("e2e-tools");
+      const res = streamText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId, {
+          permissionMode: "unrestricted",
+        }),
+        prompt: "Use the TaskList tool, then say how many tasks there are.",
+        tools: {
+          TaskList: letta.tool("TaskList", { description: "List tasks" }),
+        },
+      });
 
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
+      const types: string[] = [];
+      for await (const part of res.fullStream) types.push(part.type);
 
-        // Test generateText with reasoning
-        const response = await generateText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: "How do you think? Be brief.",
-                },
-              ],
-            },
-          ],
-        });
-
-        console.log("Generated response:");
-        console.log("Text:", response.text);
-        console.log("Response object keys:", Object.keys(response));
-
-        // Basic assertions
-        expect(response.text).toBeDefined();
-        expect(response.text.length).toBeGreaterThan(0);
-        expect(response.text).not.toContain('3:"An error occurred."');
-
-        // Check if response contains reasoning in content array
-        if (response.response && response.response.body) {
-          console.log("Response body:", response.response.body);
-        }
-
-        // Verify usage metrics
-        expect(response.usage).toBeDefined();
-        expect(response.finishReason).toBe("stop");
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
-      }
+      expect(types).toContain("tool-call");
+      expect(types.filter((t) => t === "tool-result")).toHaveLength(1);
+      expect(types).not.toContain("tool-error");
+      expect(types).not.toContain("error");
     },
+    TIMEOUT,
   );
 
   it(
-    "[generateText with prompt] should handle prompt parameter",
-    {
-      timeout: 100_000, // 100 seconds
-    },
+    "reports approval_conflict with actionable guidance",
     async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
+      const conversationId = await freshConversation("e2e-approval");
+      // Default permission mode: no approver is attached, so a tool call fails.
+      const res = streamText({
+        model: letta(),
+        providerOptions: providerOptions(conversationId),
+        prompt: "Use the TaskList tool now.",
+        tools: {
+          TaskList: letta.tool("TaskList", { description: "List tasks" }),
+        },
+      });
+
+      const errors: string[] = [];
+      for await (const part of res.fullStream) {
+        if (part.type === "error") errors.push(String((part as any).error));
       }
 
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
-
-        const result = await generateText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          prompt: "Invent a new holiday and describe its traditions.",
-        });
-
-        expect(result.text).to.exist.and.not.contain('3:"An error occurred."');
-        expect(typeof result.text).toBe("string");
-        expect(result.text.length).toBeGreaterThan(0);
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
+      if (errors.length > 0) {
+        expect(errors.join(" ")).toMatch(/permissionMode|canUseTool/);
       }
     },
-  );
-
-  it(
-    "[streamText with prompt] should handle prompt parameter",
-    {
-      timeout: 100_000, // 100 seconds
-    },
-    async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
-      }
-
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
-
-        const result = streamText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          prompt:
-            "Tell me about the future of artificial intelligence in three sentences.",
-        });
-
-        let fullText = "";
-        for await (const textPart of result.textStream) {
-          fullText += textPart;
-        }
-
-        expect(fullText).to.exist.and.not.contain('3:"An error occurred."');
-        expect(typeof fullText).toBe("string");
-        expect(fullText.length).toBeGreaterThan(0);
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
-      }
-    },
-  );
-
-  it(
-    "[combined prompt test] should handle both generateText and streamText with prompts",
-    {
-      timeout: 100_000, // 100 seconds
-    },
-    async () => {
-      if (!serviceAvailable) {
-        console.log("Skipping test: Letta service unavailable");
-        return;
-      }
-
-      let agent;
-      try {
-        agent = await lettaCloud.client.agents.create(newAgent);
-        expect(agent.name).toBe(newAgentName);
-        expect(agent.description).toBe(newAgentDescription);
-
-        // Test generateText with prompt
-        const generateResult = await generateText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          prompt: "Write a haiku about programming.",
-        });
-
-        expect(generateResult.text).to.exist.and.not.contain(
-          '3:"An error occurred."',
-        );
-        expect(generateResult.text.length).toBeGreaterThan(0);
-
-        // Test streamText with prompt
-        const streamResult = streamText({
-          model: lettaCloud(),
-          providerOptions: {
-            letta: {
-              agent: { id: agent.id },
-            },
-          },
-          prompt: "Describe your favorite food in one sentence.",
-        });
-
-        let streamedText = "";
-        for await (const textPart of streamResult.textStream) {
-          streamedText += textPart;
-        }
-
-        expect(streamedText).to.exist.and.not.contain('3:"An error occurred."');
-        expect(streamedText.length).toBeGreaterThan(0);
-      } finally {
-        // Always try to clean up
-        if (agent) {
-          try {
-            await lettaCloud.client.agents.delete(agent.id);
-            await expect(
-              lettaCloud.client.agents.retrieve(agent.id),
-            ).rejects.toHaveProperty("statusCode", 404);
-          } catch (cleanupError) {
-            console.warn("Failed to clean up agent:", cleanupError);
-          }
-        }
-      }
-    },
+    TIMEOUT,
   );
 });

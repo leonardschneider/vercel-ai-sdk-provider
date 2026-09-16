@@ -33,30 +33,36 @@ npm install @letta-ai/vercel-ai-sdk-provider
 
 ## Quick Start
 
-### 1. Environment Setup
+### 1. Choose a backend
 
-Create a `.env` file in your project root:
+The provider speaks the Letta Code **app-server protocol**, so it works against
+Letta Cloud, a local runtime, or an app server you host yourself.
 
-```bash
-# Required: Your Letta API key
-LETTA_API_KEY=your-letta-api-key
+```typescript
+import { lettaCloud, lettaLocal, lettaRemote } from '@letta-ai/vercel-ai-sdk-provider';
 
-# Optional: Override base URL (defaults to https://api.letta.com)
-LETTA_BASE_URL=https://api.letta.com
+// Letta Cloud — set LETTA_API_KEY
+const cloud = lettaCloud;
+
+// Local runtime — the SDK spawns its own app-server; state under ~/.letta
+const local = lettaLocal;
+
+// Your own app server
+const remote = lettaRemote({
+  url: 'ws://your-host:4500',
+  authToken: process.env.APP_SERVER_TOKEN, // capability token, if enabled
+});
 ```
 
-**Get your API key:** Sign up at [Letta](https://app.letta.com/) and get your API key from the [dashboard](https://app.letta.com/api-keys).
-
-**Note:** If using a `.env` file, you can source it in your shell (`source .env`) or use a package like `dotenv` to load it in your application.
-
-Alternatively, export environment variables directly:
+Start a self-hosted app server with:
 
 ```bash
-export LETTA_API_KEY=your-letta-api-key
-export LETTA_BASE_URL=https://api.letta.com  # Optional
+letta server --listen ws://0.0.0.0:4500 \
+  --ws-auth capability-token --ws-token-file /path/to/token
 ```
 
-**Note:** If using exported variables, make sure they're available in your runtime environment. You may need to source your shell profile or restart your terminal.
+Give the agent model access on that machine (`letta connect anthropic-oauth`,
+`letta connect anthropic --api-key ...`, `letta connect ollama`, …).
 
 ### 2. Basic Usage
 
@@ -144,65 +150,104 @@ for await (const textPart of result.textStream) {
 
 ### Environment Variables
 
-| Variable | Description | Default (Cloud) | Default (Local) |
-|----------|-------------|-----------------|-----------------|
-| `LETTA_API_KEY` | Your Letta API key | Required | Not required |
-| `LETTA_BASE_URL` | The base URL for Letta API | `https://api.letta.com` | `http://localhost:8283` |
+| Variable | Description | Used by |
+|----------|-------------|---------|
+| `LETTA_API_KEY` | Letta Cloud API key | `lettaCloud` |
+
+Self-hosted and local backends take their configuration as arguments rather
+than environment variables. `LETTA_BASE_URL` is no longer used: it addressed
+the retired REST API, which an app server does not serve.
 
 ### Provider Setup
 
-#### Letta Cloud (Recommended)
-
-**Required Environment Variable:**
-- `LETTA_API_KEY` - Your Letta Cloud API key
+#### Letta Cloud
 
 ```typescript
 import { lettaCloud } from '@letta-ai/vercel-ai-sdk-provider';
-
-// Requires LETTA_API_KEY environment variable
-const model = lettaCloud(); // Model configuration (LLM, temperature, etc.) is managed through your Letta agent
+const model = lettaCloud(); // model/settings live on the Letta agent
 ```
 
-#### Local Letta Instance
+#### Local runtime
 
-For local development with Letta running on `http://localhost:8283`:
-
-**No API key required!** Local instances (localhost or 127.0.0.1) automatically work without authentication.
+Agent state stays on this machine and tools execute here.
 
 ```typescript
 import { lettaLocal } from '@letta-ai/vercel-ai-sdk-provider';
-
-// Works without LETTA_API_KEY for local development
-const model = lettaLocal(); // Model configuration (LLM, temperature, etc.) is managed through your Letta agent
+const model = lettaLocal();
 ```
 
-Optionally, you can set a custom local URL:
+#### Self-hosted app server
 
-```bash
-# .env
-LETTA_BASE_URL=http://localhost:8283
+```typescript
+import { lettaRemote } from '@letta-ai/vercel-ai-sdk-provider';
+
+const letta = lettaRemote({
+  url: 'ws://your-host:4500',
+  authToken: process.env.APP_SERVER_TOKEN,
+});
+const model = letta();
 ```
 
-Or export directly:
+Tools execute on the app-server machine, not the caller's.
 
-```bash
-export LETTA_BASE_URL=http://localhost:8283
+Some runtimes — notably test runners such as vitest — ship a global
+`WebSocket` that fails to connect. Pass an implementation explicitly there:
+
+```typescript
+import WebSocket from 'ws';
+lettaRemote({ url, authToken, WebSocket });
 ```
 
-**Note:** Exported variables need to be available when running your application.
+#### One agent, many users
 
-#### Custom Configuration
+Pass a `conversationId` per end user to get isolated transcripts over one
+shared agent memory:
+
+```typescript
+providerOptions: {
+  letta: { agent: { id: 'agent-...', conversationId: 'conv-for-this-user' } },
+}
+```
+
+Omit it to use the agent's default conversation.
+
+#### Tool calls
+
+Letta agents run their own tools. Two things follow:
+
+1. **Register placeholders** so the AI SDK recognises the tool-call parts the
+   provider emits, otherwise it raises `AI_NoSuchToolError`:
+
+   ```typescript
+   tools: { TaskList: letta.tool('TaskList', { description: 'List tasks' }) },
+   ```
+
+   `tool()` has no default `execute` — adding one makes the AI SDK run the
+   placeholder and emit a second, meaningless tool result.
+
+2. **Set a permission mode.** The default asks a human to approve tool calls,
+   and a provider has no approver attached, so tool-using turns fail with
+   `approval_conflict`:
+
+   ```typescript
+   providerOptions: {
+     letta: {
+       agent: { id: 'agent-...' },
+       session: { permissionMode: 'unrestricted', allowedTools: ['TaskList'] },
+     },
+   }
+   ```
+
+   `unrestricted` runs server-side tools (including `Bash`) without prompting;
+   scope the toolset with `allowedTools` accordingly.
+
+#### Custom configuration
 
 ```typescript
 import { createLetta } from '@letta-ai/vercel-ai-sdk-provider';
 
-// For cloud/remote instances - requires API key
-const letta = createLetta({
-  baseUrl: 'https://your-custom-letta-endpoint.com',
-  token: 'your-access-token'
-});
-
-const model = letta(); // Model configuration (LLM, temperature, etc.) is managed through your Letta agent
+const letta = createLetta({ backend: 'remote', url: 'ws://host:4500', authToken: '...' });
+const model = letta();
 ```
 
 ## Working with Letta Agents
@@ -212,10 +257,10 @@ const model = letta(); // Model configuration (LLM, temperature, etc.) is manage
 ```typescript
 // https://docs.letta.com/api-reference/agents/create
 
-import { LettaClient } from "@letta-ai/letta-client";
+import { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 
-const client = new LettaClient({
-  token: process.env.LETTA_API_KEY,
+const client = new LettaAgentClient({
+  backend: 'cloud',
   project: "your-project-id" // optional param
 });
 
@@ -352,7 +397,7 @@ export function Chat({ agentId, existingMessages = [] }: ChatProps) {
 
 ```typescript
 // app/page.tsx - Streaming chat page
-import { LettaClient } from '@letta-ai/letta-client';
+import { LettaAgentClient } from '@letta-ai/letta-agent-sdk';
 import { convertToAiSdkMessage } from '@letta-ai/vercel-ai-sdk-provider';
 import { Chat } from './Chat';
 
@@ -364,7 +409,7 @@ export default async function HomePage() {
   }
 
   // Load existing messages
-  const client = new LettaClient({
+  const client = new LettaAgentClient({
     token: process.env.LETTA_API_KEY
   });
 
@@ -922,9 +967,9 @@ interface ProviderOptions {
 **Agent not found error:**
 ```typescript
 // List available agents
-import { LettaClient } from '@letta-ai/letta-client';
+import { LettaAgentClient } from '@letta-ai/letta-agent-sdk';
 
-const client = new LettaClient({ token: process.env.LETTA_API_KEY });
+const client = new LettaAgentClient({ backend: 'cloud' });
 const agents = await client.agents.list();
 console.log('Available agents:', agents.map(a => ({ id: a.id, name: a.name })));
 ```
@@ -942,7 +987,6 @@ console.log('Available agents:', agents.map(a => ({ id: a.id, name: a.name })));
 **Local development:**
 ```bash
 # Set environment for local development
-LETTA_BASE_URL=http://localhost:8283
 ```
 
 

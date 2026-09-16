@@ -1,16 +1,3 @@
-.DS_Store
-node_modules
-.turbo
-*.log
-.next
-dist-ssr
-*.local
-.env
-.cache
-server/dist
-public/dist
-test-results
-dist
-.idea
-# Ignore cloned test apps
-/test-apps/
+node_modules/
+dist/
+*.tgz

@@ -40,18 +40,24 @@ export function tool(
   name: string,
   options: Partial<Tool<any, any>> = {},
 ): Tool<any, any> {
-  const {
-    description = `${name} tool`,
-    inputSchema = z.any(),
-    execute = async (_args?: unknown, _ctx?: unknown) => "Handled by Letta",
-  } = options;
+  const { description = `${name} tool`, inputSchema = z.any() } = options;
 
-  return {
+  // No default `execute`. The Letta agent runs the tool on its own side and
+  // the provider emits the real tool-result; if this placeholder also had an
+  // execute, the AI SDK would run it and emit a SECOND, meaningless result.
+  // Registering it without execute is purely so the AI SDK recognises the
+  // tool name — otherwise it raises AI_NoSuchToolError on the tool-call part.
+  const placeholder: Tool<any, any> = {
     description,
     inputSchema,
-    execute,
     onInputAvailable: undefined,
     onInputStart: undefined,
     onInputDelta: undefined,
-  };
+  } as Tool<any, any>;
+
+  if (options.execute) {
+    (placeholder as { execute?: unknown }).execute = options.execute;
+  }
+
+  return placeholder;
 }
