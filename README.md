@@ -106,45 +106,38 @@ for await (const textPart of result.textStream) {
 }
 ```
 
-### 3. Utilize Letta-Specific Send Message Parameters (Advanced)
-**Send Message:**
-Use `providerOptions.agent` to configure non-streaming message creation with Letta agents.
-Documentation: https://docs.letta.com/api-reference/agents/messages/create
+### 3. Configure the session (Advanced)
 
-**Send Message Streaming:**
-Use `providerOptions.agent` to configure streaming message creation with Letta agents.
-Documentation: https://docs.letta.com/api-reference/agents/messages/create-stream
-
-**Timeout Configuration:**
-Use `providerOptions.timeoutInSeconds` to set the maximum wait time for agent responses. This is especially important for long-running agent operations or when working with complex reasoning chains.
+Everything about how a turn runs — model override, reasoning effort,
+permission mode, allowed tools, client-executed tools, MCP servers — is set
+through `providerOptions.letta.session`, which is passed to the SDK's
+`resumeSession`:
 
 ```typescript
-import { lettaCloud } from '@letta-ai/vercel-ai-sdk-provider';
-import { streamText } from 'ai';
-
-const result = streamText({
-  model: lettaCloud(), // Model configuration (LLM, temperature, etc.) is managed through your Letta agent
+const result = await generateText({
+  model: letta(),
   providerOptions: {
     letta: {
-      agent: {
-        id: 'your-agent-id',
-        maxSteps: 100,
-        background: true,
-        includePings: true,
-        // See more available request params here:
-        // https://docs.letta.com/api-reference/agents/messages/create-stream
+      agent: { id: 'agent-...', conversationId: 'conv-for-this-user' },
+      session: {
+        model: 'anthropic/claude-fable-5',
+        reasoningEffort: 'medium',
+        permissionMode: 'unrestricted',
+        allowedTools: ['TaskList'],
       },
-      timeoutInSeconds: 300 // The maximum time to wait for a response in seconds (default: 1000)
-    }
+    },
   },
-  prompt: 'Tell me a story about a robot learning to paint.',
+  prompt: 'Summarise today\'s tasks.',
 });
-
-for await (const textPart of result.textStream) {
-  console.log(textPart);
-}
 ```
 
+Sessions are cached per agent/conversation and reused across turns, so these
+options take effect when a conversation's session is first opened. Call
+`letta.close()` on shutdown to release them.
+
+The 1.x request parameters (`maxSteps`, `background`, `timeoutInSeconds`,
+`includePings`, ...) were REST-specific and are no longer accepted; passing
+them produces a call warning. See CHANGELOG.md.
 
 ## Configuration
 
@@ -468,77 +461,16 @@ message.parts?.forEach((part) => {
 
 ## Advanced Features
 
-### Message Roles (System vs User)
+### System prompts
 
-Letta agents support different message roles. You can send messages as `user` or `system`:
+A Letta agent owns its instructions: they live in its memory blocks and
+persona, and evolve as the agent learns. A `system` message in the AI SDK
+prompt therefore has nowhere to go and is **not forwarded**; the provider emits
+a call warning if one is present. Configure instructions on the agent (via the
+Letta CLI, the agent's memory, or `createAgent`) rather than per request.
 
-```typescript
-import { lettaCloud } from '@letta-ai/vercel-ai-sdk-provider';
-import { generateText } from 'ai';
-
-// Using prompt (defaults to user role)
-const promptResult = await generateText({
-  model: lettaCloud(),
-  providerOptions: {
-    letta: {
-      agent: { id: 'your-agent-id' }
-    }
-  },
-  prompt: 'What is the weather like today?', // Automatically sent as role: 'user'
-});
-
-// User message - using messages array (same as prompt above)
-const userResult = await generateText({
-  model: lettaCloud(),
-  providerOptions: {
-    letta: {
-      agent: { id: 'your-agent-id' }
-    }
-  },
-  messages: [
-    { role: 'user', content: 'What is the weather like today?' }
-  ],
-});
-
-// System message - for instructions or context
-const systemResult = await generateText({
-  model: lettaCloud(),
-  providerOptions: {
-    letta: {
-      agent: { id: 'your-agent-id' }
-    }
-  },
-  messages: [
-    { role: 'system', content: 'The user prefers metric units. Always provide temperature in Celsius.' }
-  ],
-});
-
-
-// 🔴 Note: This will NOT send multiple messages to the agent
-const systemResult = await generateText({
-  model: lettaCloud(),
-  providerOptions: {
-    letta: {
-      agent: { id: 'your-agent-id' }
-    }
-  },
-  messages: [
-    { role: 'user', content: 'What is the weather like today?' },
-    { role: 'system', content: 'The user prefers metric units. Always provide temperature in Celsius.' },
-    { role: 'user', content: 'I like the weather today.' } // Only this last message will get sent to the agent
-  ],
-});
-```
-
-**Message Role Behavior:**
-- **`prompt`**: Convenience parameter that defaults to `role: 'user'`
-- **`user`**: Standard conversational messages from the user
-- **`system`**: Instructions, context, or configuration for the agent's behavior
-
-**Important:**
-- Letta accepts only **one message at a time** in the messages array. The backend SDK processes messages sequentially.
-- Using `prompt` is equivalent to sending a single message with `role: 'user'`
-- For conversation history, use the `convertToAiSdkMessage` utility to load existing messages from your Letta agent (see "Using Existing Messages" section below).
+Only the newest `user` message is sent each turn — the agent holds the
+transcript server-side, so earlier history in the prompt is not replayed.
 
 ### Reasoning Support
 
@@ -842,71 +774,29 @@ const stream = streamText({
 });
 ```
 
-### Long-Running Executions
+### Long-running turns
 
-For streaming operations that may take longer to complete, you can use the `background` option:
+The agent runs its full tool loop server-side within one turn; there is no
+per-request step limit to set. To bound a turn, use the AI SDK's `abortSignal`
+(honoured, and stops the agent server-side) or `AbortSignal.timeout(ms)`:
 
 ```typescript
-// Streaming with background execution
-const stream = streamText({
-  model: lettaCloud(),
-  prompt: 'Process this complex task...',
-  providerOptions: {
-    letta: {
-      agent: { id: 'your-agent-id' },
-      background: true
-      // See more available request params here:
-      // https://docs.letta.com/api-reference/agents/messages/create-stream
-    }
-  },
+const result = await generateText({
+  model: letta(),
+  providerOptions: { letta: { agent: { id: 'agent-...' } } },
+  prompt: 'Research this thoroughly.',
+  abortSignal: AbortSignal.timeout(120_000),
 });
 ```
 
-**Note**: Background executions are useful for complex streaming tasks that may exceed typical request timeouts. See [Letta's long-running guide](https://docs.letta.com/guides/agents/long-running) for more details.
+An aborted turn completes with `finishReason: "other"`.
 
-### Stop Conditions
+### Stop conditions
 
-The Vercel AI SDK provides a `stopWhen` parameter to control when generation stops. However, **`stopWhen` only affects what the AI SDK returns to your application—it does not control Letta's backend execution.**
-
-**Important**: If you want to limit the number of steps Letta executes on the backend, use `maxSteps` in `providerOptions.letta.agent.maxSteps` instead of relying on `stopWhen`.
-
-```typescript
-// 🔴 This will NOT stop Letta from executing 10 steps on the backend
-const result = await generateText({
-  model: lettaCloud(),
-  prompt: 'Help me with a task',
-  providerOptions: {
-    letta: {
-      agent: {
-        id: 'your-agent-id',
-        maxSteps: 10  // Letta will execute up to 10 steps
-      }
-    }
-  },
-  stopWhen: stepCountIs(5)  // AI SDK stops after 5 steps, but Letta already executed 10
-});
-
-// ✅ This correctly limits Letta to 5 steps
-const result = await generateText({
-  model: lettaCloud(),
-  prompt: 'Help me with a task',
-  providerOptions: {
-    letta: {
-      agent: {
-        id: 'your-agent-id',
-        maxSteps: 5  // Letta will only execute 5 steps
-      }
-    }
-  },
-});
-```
-
-**Why this matters**: When you set `maxSteps: 10` on the Letta side and `stopWhen: stepCountIs(5)` on the AI SDK side:
-- Letta's backend will execute all 10 steps
-- The AI SDK will only return/display the first 5 steps to your application
-- You'll be charged for 10 steps but only see 5 steps in your results
-
-**Best practice**: Set `maxSteps` in `providerOptions.letta.agent.maxSteps` to control Letta's execution, and only use `stopWhen` if you need additional client-side filtering logic.
+Tool calls the agent makes are reported as provider-executed, so the AI SDK
+never starts a second step to run them: each `generateText`/`streamText` call
+is exactly one Letta turn regardless of `stopWhen`. Use `stopWhen` only if you
+drive your own client-side tools alongside the agent.
 
 ### When to Use Each Approach
 
@@ -939,23 +829,23 @@ const result = await generateText({
 ### Configuration Options
 
 ```typescript
-interface ProviderOptions {
-  // https://docs.letta.com/api-reference/agents/messages/create-stream
+interface LettaProviderOptions {
   letta: {
-   agent: {
-      id?: string;
-      background?: boolean;
-      maxSteps?: number;
-      useAssistantMessage?: boolean;
-      assistantMessageToolName?: string;
-      assistantMessageToolKwarg?: string;
-      includeReturnMessageTypes?: MessageType[] | null;
-      enableThinking?: string;
-      streamTokens?: boolean;
-      includePings?: boolean;
+    agent: {
+      id?: string;              // required: the Letta agent to run against
+      conversationId?: string;  // optional: one conversation per end user
     };
-    timeoutInSeconds?: number;
-  }
+    session?: {                 // passed to the SDK's resumeSession
+      model?: string;
+      reasoningEffort?: "low" | "medium" | "high";
+      permissionMode?: "standard" | "acceptEdits" | "unrestricted";
+      allowedTools?: string[];
+      tools?: AgentTool[];      // run in YOUR process
+      mcpServers?: McpServers;
+      canUseTool?: CanUseToolCallback;
+      cwd?: string;
+    };
+  };
 }
 ```
 

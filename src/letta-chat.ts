@@ -10,6 +10,7 @@ import {
 import {
   LettaAgentClient,
   extractStreamTextDelta,
+  type LettaCodeSession,
   type LettaCodeClientSessionOptions,
   type SDKMessage,
 } from "@letta-ai/letta-agent-sdk";
@@ -30,6 +31,9 @@ export interface LettaProviderOptions {
     /**
      * Passed through to createSession/resumeSession — model override,
      * permissionMode, allowedTools, client-executed `tools`, mcpServers, cwd.
+     *
+     * Sessions are cached per agent/conversation and reused across turns, so
+     * these options take effect when the session is first opened.
      */
     session?: LettaCodeClientSessionOptions;
   };
@@ -48,6 +52,22 @@ const UNKNOWN_USAGE: LanguageModelV2Usage = {
   outputTokens: undefined,
   totalTokens: undefined,
 };
+
+/**
+ * Options the REST-era provider accepted under `providerOptions.letta.agent`.
+ * None map onto the app-server session; say so rather than ignore them.
+ */
+const LEGACY_AGENT_OPTIONS = [
+  "background",
+  "maxSteps",
+  "useAssistantMessage",
+  "assistantMessageToolName",
+  "assistantMessageToolKwarg",
+  "includeReturnMessageTypes",
+  "enableThinking",
+  "streamTokens",
+  "includePings",
+] as const;
 
 /**
  * Letta's default permission mode requires a human to approve tool calls.
@@ -87,6 +107,89 @@ function mapStopReason(
   }
 }
 
+/** Token counts arrive as a `usage_statistics` stream event before `result`. */
+function usageFromEvent(event: unknown): LanguageModelV2Usage | null {
+  const e = event as Record<string, unknown> | null;
+  if (!e || e.message_type !== "usage_statistics") return null;
+  const n = (v: unknown) => (typeof v === "number" ? v : undefined);
+  return {
+    inputTokens: n(e.prompt_tokens),
+    outputTokens: n(e.completion_tokens),
+    totalTokens: n(e.total_tokens),
+    reasoningTokens: n(e.reasoning_tokens),
+    cachedInputTokens: n(e.cached_input_tokens),
+  };
+}
+
+/**
+ * One live session per agent/conversation, reused across turns.
+ *
+ * Opening a session is the expensive part of a turn — for the local backend
+ * it spawns an app-server subprocess and waits for it to listen; for remote
+ * and cloud it is a websocket connect plus a runtime handshake — and the SDK
+ * is built around one long-lived session per conversation. Turns on the same
+ * key are serialised so two overlapping requests never interleave one
+ * session's stream.
+ */
+export class SessionPool implements AsyncDisposable {
+  private readonly sessions = new Map<string, LettaCodeSession>();
+  private readonly locks = new Map<string, Promise<void>>();
+
+  constructor(readonly client: LettaAgentClient) {}
+
+  acquire(key: string, options?: LettaCodeClientSessionOptions): LettaCodeSession {
+    let session = this.sessions.get(key);
+    if (!session) {
+      session = this.client.resumeSession(key, options);
+      this.sessions.set(key, session);
+    }
+    return session;
+  }
+
+  /** Drop a session whose transport failed so the next turn reconnects. */
+  async evict(key: string): Promise<void> {
+    const session = this.sessions.get(key);
+    this.sessions.delete(key);
+    if (session) {
+      await Promise.resolve(session[Symbol.asyncDispose]()).catch(() => {
+        /* already gone */
+      });
+    }
+  }
+
+  /** Wait for any in-flight turn on `key`, then hold the lock until released. */
+  async lock(key: string): Promise<() => void> {
+    const previous = this.locks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.locks.set(
+      key,
+      previous.then(() => mine),
+    );
+    await previous;
+    return release;
+  }
+
+  async close(): Promise<void> {
+    const open = [...this.sessions.values()];
+    this.sessions.clear();
+    this.locks.clear();
+    await Promise.all(
+      open.map((s) =>
+        Promise.resolve(s[Symbol.asyncDispose]()).catch(() => {
+          /* best effort */
+        }),
+      ),
+    );
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
+  }
+}
+
 /**
  * The agent SDK emits one `assistant`/`reasoning` SDKMessage per streamed
  * chunk. Each chunk has its own uuid, but every chunk of one logical message
@@ -103,10 +206,17 @@ export class LettaChatModel implements LanguageModelV2 {
   readonly modelId = "placeholder"; // model selection lives on the Letta agent
   readonly supportedUrls = {};
 
-  private readonly client: LettaAgentClient;
+  private readonly pool: SessionPool;
 
-  constructor(client: LettaAgentClient) {
-    this.client = client;
+  /**
+   * Accepts a shared `SessionPool` (what `createLetta` passes, so every model
+   * from one provider reuses sessions) or a bare client for direct use.
+   */
+  constructor(source: SessionPool | LettaAgentClient) {
+    this.pool =
+      source instanceof SessionPool
+        ? source
+        : new SessionPool(source as LettaAgentClient);
   }
 
   private getArgs(options: LanguageModelV2CallOptions): TurnArgs {
@@ -124,6 +234,35 @@ export class LettaChatModel implements LanguageModelV2 {
         "Letta provider requires an agentId in providerOptions. Usage: " +
           "streamText({ model: letta(), providerOptions: { letta: { agent: { id: 'agent-...' } } }, ... })",
       );
+    }
+
+    // Options from the REST-era provider that have no session equivalent.
+    const agentOpts = (letta?.agent ?? {}) as Record<string, unknown>;
+    const legacy = LEGACY_AGENT_OPTIONS.filter((k) => agentOpts[k] !== undefined);
+    if ((letta as Record<string, unknown> | undefined)?.timeoutInSeconds !== undefined) {
+      legacy.push("timeoutInSeconds" as never);
+    }
+    if (legacy.length > 0) {
+      warnings.push({
+        type: "other",
+        message:
+          `providerOptions.letta.agent.{${legacy.join(", ")}} ` +
+          `${legacy.length === 1 ? "is" : "are"} not supported by the ` +
+          `app-server transport and will be ignored. Session behaviour is ` +
+          `configured via providerOptions.letta.session (model, ` +
+          `reasoningEffort, permissionMode, allowedTools, tools, mcpServers).`,
+      });
+    }
+
+    // Letta agents own their system prompt (memory blocks); a system message
+    // in the AI SDK prompt has nowhere to go. Say so rather than drop it.
+    if (options.prompt.some((m) => m.role === "system")) {
+      warnings.push({
+        type: "other",
+        message:
+          "System messages are not forwarded: a Letta agent's instructions " +
+          "live in its memory blocks. Configure them on the agent instead.",
+      });
     }
 
     // A Letta agent owns its toolset. Tool definitions passed through the AI
@@ -159,15 +298,6 @@ export class LettaChatModel implements LanguageModelV2 {
     };
   }
 
-  private openSession(args: TurnArgs) {
-    // resumeSession(agentId) continues the agent's default conversation;
-    // resumeSession(conversationId) continues that specific one.
-    return this.client.resumeSession(
-      args.conversationId ?? args.agentId,
-      args.sessionOptions,
-    );
-  }
-
   /**
    * One turn, mapped from SDKMessage events to AI SDK stream parts.
    * Shared by doStream and doGenerate so both agree on semantics.
@@ -180,11 +310,14 @@ export class LettaChatModel implements LanguageModelV2 {
     args: TurnArgs,
     abort: AbortController,
   ): AsyncGenerator<LanguageModelV2StreamPart> {
-    const session = this.openSession(args);
+    // resumeSession(agentId) continues the agent's default conversation;
+    // resumeSession(conversationId) continues that specific one.
+    const key = args.conversationId ?? args.agentId;
 
     let finishReason: LanguageModelV2FinishReason = "stop";
-    const usage: LanguageModelV2Usage = UNKNOWN_USAGE;
+    let usage: LanguageModelV2Usage = UNKNOWN_USAGE;
     let errorEmitted = false;
+    let transportFailed = false;
 
     let block: Block | null = null;
     const toolNames = new Map<string, string>();
@@ -214,21 +347,24 @@ export class LettaChatModel implements LanguageModelV2 {
       yield { type: `${kind}-delta`, id, delta: text } as LanguageModelV2StreamPart;
     }
 
+    // Nothing to do if the caller already gave up: don't touch the session.
+    if (abort.signal.aborted) {
+      yield { type: "finish", finishReason: "other", usage };
+      return;
+    }
+
+    const release = await this.pool.lock(key);
+    const session = this.pool.acquire(key, args.sessionOptions);
+
     const onAbort = () => {
       void session.abort().catch(() => {
         /* the turn may already be finished */
       });
     };
 
-    // The turn body is its own generator so an early `return` (caller already
-    // gave up) still falls through to the `finish` part below.
+    // The turn body is its own generator so an early `return` (caller gave
+    // up while we waited) still falls through to the `finish` part below.
     const body = async function* (): AsyncGenerator<LanguageModelV2StreamPart> {
-      // Nothing to do if the caller already gave up: don't start a turn.
-      if (abort.signal.aborted) {
-        finishReason = "other";
-        return;
-      }
-
       // abort() is a no-op until the session has initialised, and send() is
       // what initialises it — so bring the runtime up first, then re-check.
       await session.ready();
@@ -243,6 +379,11 @@ export class LettaChatModel implements LanguageModelV2 {
       for await (const message of session.stream() as AsyncGenerator<SDKMessage>) {
         switch (message.type) {
           case "stream_event": {
+            const u = usageFromEvent(message.event);
+            if (u) {
+              usage = u;
+              break;
+            }
             const delta = extractStreamTextDelta(message.event);
             if (delta?.text) {
               yield* content(
@@ -356,9 +497,15 @@ export class LettaChatModel implements LanguageModelV2 {
 
     try {
       yield* body();
+    } catch (error) {
+      // A throw here is the transport, not the agent: drop the session so
+      // the next turn reconnects instead of reusing a dead socket.
+      transportFailed = true;
+      throw error;
     } finally {
       abort.signal.removeEventListener("abort", onAbort);
-      await session[Symbol.asyncDispose]();
+      if (transportFailed) await this.pool.evict(key);
+      release();
     }
 
     yield { type: "finish", finishReason, usage };

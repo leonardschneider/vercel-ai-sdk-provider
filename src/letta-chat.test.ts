@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { LettaChatModel } from "./letta-chat";
+import { LettaChatModel, SessionPool } from "./letta-chat";
 
 type Part = Record<string, any>;
 
@@ -116,13 +116,43 @@ describe("LettaChatModel — turn plumbing", () => {
     expect(handle.sent).toEqual(["newest"]);
   });
 
-  test("disposes the session after a turn", async () => {
+  test("keeps the session open after a turn and reuses it", async () => {
+    // Opening a session is the expensive part (subprocess spawn / websocket
+    // handshake); it must survive the turn and be reused on the same key.
+    const { client, handle, resumeSession } = fakeClient([
+      { type: "assistant", content: "hello", uuid: "u1" },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const model = new LettaChatModel(client);
+    await collect(model, opts());
+    expect(handle.disposed).toBe(0);
+    await collect(model, opts());
+    expect(resumeSession).toHaveBeenCalledTimes(1);
+    expect(handle.disposed).toBe(0);
+  });
+
+  test("SessionPool.close() disposes every cached session", async () => {
     const { client, handle } = fakeClient([
       { type: "assistant", content: "hello", uuid: "u1" },
       { type: "result", success: true, durationMs: 1, conversationId: "c" },
     ]);
-    await collect(new LettaChatModel(client), opts());
+    const pool = new SessionPool(client);
+    await collect(new LettaChatModel(pool), opts());
+    expect(handle.disposed).toBe(0);
+    await pool.close();
     expect(handle.disposed).toBe(1);
+    await pool.close(); // idempotent
+    expect(handle.disposed).toBe(1);
+  });
+
+  test("evicts a session whose transport threw so the next turn reconnects", async () => {
+    const f = fakeSession([new Error("socket closed")]);
+    const resumeSession = vi.fn(() => f.session);
+    const model = new LettaChatModel({ resumeSession } as any);
+    await collect(model, opts());
+    expect(f.disposed).toBe(1); // evicted
+    await collect(model, opts());
+    expect(resumeSession).toHaveBeenCalledTimes(2); // reconnected
   });
 
   test("aborts the server-side turn when the caller aborts", async () => {
@@ -142,28 +172,32 @@ describe("LettaChatModel — turn plumbing", () => {
       abortSignal: controller.signal,
     });
     const reader = stream.getReader();
-    await reader.read();
+    // Read until real content: that proves send() ran and the listener is on.
+    for (;;) {
+      const { value } = await reader.read();
+      if ((value as Part).type === "text-delta") break;
+    }
     controller.abort();
     await new Promise((r) => setTimeout(r, 0));
     expect(aborted).toEqual(["abort"]);
   });
 
-  test("an already-aborted signal starts no turn at all", async () => {
+  test("an already-aborted signal starts no turn and opens no session", async () => {
     const f = fakeSession([
       { type: "assistant", content: "should never be sent", uuid: "u1" },
       { type: "result", success: true, durationMs: 1, conversationId: "c" },
     ]);
-    const client = { resumeSession: vi.fn(() => f.session) } as any;
-    const parts = await collect(new LettaChatModel(client), {
+    const resumeSession = vi.fn(() => f.session);
+    const parts = await collect(new LettaChatModel({ resumeSession } as any), {
       ...opts(),
       abortSignal: AbortSignal.abort(),
     });
     // Nothing was sent, so the agent never ran; cancellation is not an error.
+    expect(resumeSession).not.toHaveBeenCalled();
     expect(f.sent).toEqual([]);
     expect(textOf(parts)).toBe("");
     expect(parts.find((p) => p.type === "finish")!.finishReason).toBe("other");
     expect(parts.some((p) => p.type === "error")).toBe(false);
-    expect(f.disposed).toBe(1);
   });
 
   test("brings the session up before registering abort, so abort is not a no-op", async () => {
@@ -202,7 +236,7 @@ describe("LettaChatModel — turn plumbing", () => {
     await reader.read(); // first content part
     await reader.cancel();
     expect(aborted).toEqual(["abort"]);
-    expect(f.disposed).toBe(1);
+    expect(f.disposed).toBe(0); // cancelled turn, session kept for reuse
   });
 
   test("an abort that lands mid-turn reports a cancellation, not an error", async () => {
@@ -672,13 +706,11 @@ describe("LettaChatModel — concurrency", () => {
       { type: "assistant", content: "B", uuid: "b" },
       { type: "result", success: true, durationMs: 1, conversationId: "cb" },
     ]);
-    const client = {
-      resumeSession: vi.fn((id: string) =>
-        id === "conv-a" ? sessionA.session : sessionB.session,
-      ),
-    } as any;
-
-    const model = new LettaChatModel(client);
+    const resumeSession = vi.fn((id: string) =>
+      id === "conv-a" ? sessionA.session : sessionB.session,
+    );
+    const pool = new SessionPool({ resumeSession } as any);
+    const model = new LettaChatModel(pool);
     const [a, b] = await Promise.all([
       collect(model, opts({}, { conversationId: "conv-a" })),
       collect(model, opts({}, { conversationId: "conv-b" })),
@@ -686,8 +718,32 @@ describe("LettaChatModel — concurrency", () => {
 
     expect(textOf(a)).toBe("AAA");
     expect(textOf(b)).toBe("BBB");
+    expect(resumeSession).toHaveBeenCalledTimes(2);
+    await pool.close();
     expect(sessionA.disposed).toBe(1);
     expect(sessionB.disposed).toBe(1);
+  });
+
+  test("two turns on the SAME conversation are serialised, not interleaved", async () => {
+    const order: string[] = [];
+    const f = fakeSession([
+      { type: "assistant", content: "x", uuid: "u1" },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const origSend = f.session.send;
+    (f.session as any).send = async (m: any) => {
+      order.push(`send:${m}`);
+      await new Promise((r) => setTimeout(r, 5));
+      return origSend(m);
+    };
+    const model = new LettaChatModel({ resumeSession: vi.fn(() => f.session) } as any);
+    const turn = (text: string) =>
+      collect(model, {
+        prompt: [{ role: "user", content: [{ type: "text", text }] }],
+        providerOptions: { letta: { agent: { id: "agent-1", conversationId: "same" } } },
+      } as any);
+    await Promise.all([turn("first"), turn("second")]);
+    expect(order).toEqual(["send:first", "send:second"]);
   });
 
   test("concurrent turns each get their own session", async () => {
@@ -702,14 +758,14 @@ describe("LettaChatModel — concurrency", () => {
       ["c2", make("two")],
       ["c3", make("three")],
     ]);
-    const client = {
+    const pool = new SessionPool({
       resumeSession: vi.fn((id: string) => {
         seen.push(id);
         return sessions.get(id)!.session;
       }),
-    } as any;
+    } as any);
 
-    const model = new LettaChatModel(client);
+    const model = new LettaChatModel(pool);
     const results = await Promise.all(
       ["c1", "c2", "c3"].map((id) =>
         collect(model, opts({}, { conversationId: id })),
@@ -718,6 +774,8 @@ describe("LettaChatModel — concurrency", () => {
 
     expect(results.map(textOf)).toEqual(["one", "two", "three"]);
     expect(seen.sort()).toEqual(["c1", "c2", "c3"]);
+    for (const s of sessions.values()) expect(s.disposed).toBe(0);
+    await pool.close();
     for (const s of sessions.values()) expect(s.disposed).toBe(1);
   });
 });
@@ -871,6 +929,69 @@ describe("LettaChatModel — warnings", () => {
       .warnings.map((w: any) => w.setting);
     expect(settings).toContain("temperature");
     expect(settings).toContain("topP");
+  });
+});
+
+describe("LettaChatModel — usage and legacy-option warnings", () => {
+  test("captures token counts from the usage_statistics stream event", async () => {
+    const { client } = fakeClient([
+      { type: "assistant", content: "hi", uuid: "u1" },
+      {
+        type: "stream_event",
+        uuid: "u2",
+        event: {
+          message_type: "usage_statistics",
+          prompt_tokens: 120,
+          completion_tokens: 30,
+          total_tokens: 150,
+          reasoning_tokens: 7,
+          cached_input_tokens: 100,
+        },
+      },
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), opts());
+    const finish = parts.find((p) => p.type === "finish")!;
+    expect(finish.usage).toEqual({
+      inputTokens: 120,
+      outputTokens: 30,
+      totalTokens: 150,
+      reasoningTokens: 7,
+      cachedInputTokens: 100,
+    });
+    // and the usage event itself produced no content part
+    expect(textOf(parts)).toBe("hi");
+  });
+
+  test("warns about each retired REST-era agent option instead of ignoring it", async () => {
+    const { client } = fakeClient([
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(
+      new LettaChatModel(client),
+      opts({}, { maxSteps: 5, background: true }),
+    );
+    const w = parts.find((p) => p.type === "stream-start")!.warnings as any[];
+    const msg = w.map((x) => x.message ?? "").join(" ");
+    expect(msg).toContain("maxSteps");
+    expect(msg).toContain("background");
+    expect(msg).toContain("providerOptions.letta.session");
+  });
+
+  test("warns that system messages are not forwarded", async () => {
+    const { client, handle } = fakeClient([
+      { type: "result", success: true, durationMs: 1, conversationId: "c" },
+    ]);
+    const parts = await collect(new LettaChatModel(client), {
+      prompt: [
+        { role: "system", content: "Always use Celsius." },
+        { role: "user", content: [{ type: "text", text: "temp?" }] },
+      ],
+      providerOptions: { letta: { agent: { id: "agent-1" } } },
+    } as any);
+    const w = parts.find((p) => p.type === "stream-start")!.warnings as any[];
+    expect(w.some((x) => /System messages are not forwarded/.test(x.message ?? ""))).toBe(true);
+    expect(handle.sent).toEqual(["temp?"]); // the user turn still goes through
   });
 });
 

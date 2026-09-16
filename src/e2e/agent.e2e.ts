@@ -47,9 +47,8 @@ describe.skipIf(!configured)("letta provider e2e", () => {
   });
 
   afterAll(async () => {
-    await (letta?.client as unknown as AsyncDisposable)?.[
-      Symbol.asyncDispose
-    ]?.();
+    // Disposes every cached session (they are reused across turns now).
+    await letta?.close();
   });
 
   async function freshConversation(name: string): Promise<string> {
@@ -87,6 +86,10 @@ describe.skipIf(!configured)("letta provider e2e", () => {
 
       expect(text).toContain("E2E-OK");
       expect(await res.finishReason).toBe("stop");
+      // Fix #7: token counts come from the server's usage_statistics event.
+      const usage = await res.usage;
+      expect(usage.totalTokens ?? 0).toBeGreaterThan(0);
+      expect(usage.inputTokens ?? 0).toBeGreaterThan(0);
     },
     TIMEOUT,
   );

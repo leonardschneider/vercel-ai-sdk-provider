@@ -20,20 +20,42 @@ const { createLetta, lettaCloud, lettaLocal, lettaRemote } = await import(
 const { LettaChatModel } = await import("./letta-chat");
 
 describe("createLetta", () => {
-  it("defaults to the local backend", () => {
+  it("defaults to Letta Cloud, as the previous provider did", () => {
     constructed.length = 0;
-    createLetta();
-    expect(constructed[0]).toEqual({ backend: "local" });
+    createLetta()();
+    expect(constructed[0]).toEqual({ backend: "cloud" });
+  });
+
+  it("creates the client lazily, not at createLetta() time", () => {
+    constructed.length = 0;
+    const provider = createLetta();
+    expect(constructed).toHaveLength(0);
+    provider();
+    expect(constructed).toHaveLength(1);
+    provider();
+    expect(constructed).toHaveLength(1); // shared across models
   });
 
   it("passes options straight through to the client", () => {
     constructed.length = 0;
-    createLetta({ backend: "remote", url: "ws://x:1", authToken: "t" } as any);
+    createLetta({ backend: "remote", url: "ws://x:1", authToken: "t" } as any)();
     expect(constructed[0]).toMatchObject({
       backend: "remote",
       url: "ws://x:1",
       authToken: "t",
     });
+  });
+
+  it("rejects the retired REST option shape with migration guidance", () => {
+    expect(() =>
+      createLetta({ baseUrl: "https://custom.letta.com", token: "x" } as any),
+    ).toThrow(/retired REST transport.*lettaRemote/s);
+  });
+
+  it("close() resolves and is safe to call before any session exists", async () => {
+    const provider = createLetta();
+    await expect(provider.close()).resolves.toBeUndefined();
+    await expect(provider[Symbol.asyncDispose]()).resolves.toBeUndefined();
   });
 
   it("exposes the underlying client and the tool helper", () => {
@@ -79,7 +101,7 @@ describe("provider call signature", () => {
 describe("lettaRemote", () => {
   it("selects the remote backend and forwards the url and token", () => {
     constructed.length = 0;
-    lettaRemote({ url: "ws://host:4500", authToken: "cap-token" });
+    lettaRemote({ url: "ws://host:4500", authToken: "cap-token" })();
     expect(constructed[0]).toEqual({
       backend: "remote",
       url: "ws://host:4500",
@@ -90,13 +112,13 @@ describe("lettaRemote", () => {
   it("forwards an explicit WebSocket implementation", () => {
     constructed.length = 0;
     const FakeWs = class {} as any;
-    lettaRemote({ url: "ws://host:4500", WebSocket: FakeWs });
+    lettaRemote({ url: "ws://host:4500", WebSocket: FakeWs })();
     expect(constructed[0].WebSocket).toBe(FakeWs);
   });
 
   it("forwards requestTimeoutMs", () => {
     constructed.length = 0;
-    lettaRemote({ url: "ws://host:4500", requestTimeoutMs: 1234 });
+    lettaRemote({ url: "ws://host:4500", requestTimeoutMs: 1234 })();
     expect(constructed[0].requestTimeoutMs).toBe(1234);
   });
 

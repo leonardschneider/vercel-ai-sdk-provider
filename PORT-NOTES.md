@@ -24,7 +24,7 @@ backend for exactly this.
 
 | File | Change |
 |---|---|
-| `letta-provider.ts` | `LettaClient` → `LettaAgentClient`; added `lettaRemote({url, authToken})`; `lettaLocal` now means `backend: "local"` (was the dead `localhost:8283`) |
+| `letta-provider.ts` | `LettaClient` → `LettaAgentClient`, created lazily on first use; `createLetta()` still defaults to Cloud and rejects the retired `{baseUrl, token}` shape; `lettaCloud` honours `LETTA_BASE_URL`; added `lettaRemote(...)` and `close()`; `lettaLocal` now means `backend: "local"` (was the dead `localhost:8283`) — see CHANGELOG.md |
 | `letta-chat.ts` | `agents.messages.create/createStream` → `resumeSession()` + `send()` + `stream()`; maps `SDKMessage` variants to AI SDK stream parts (tool parts provider-executed, blocks keyed by otid); shared `runTurn` so generate and stream agree; abort/cancel reach the agent |
 | `convert-to-letta-message.ts` | `MessageCreate[]` → `SendMessage` (sends only the newest user message; the transcript lives server-side) |
 | `convert-to-ai-sdk-message.ts` | `LettaMessageUnion` → `SDKMessage`; tool results now upgrade their matching call part by `toolCallId` |
@@ -106,6 +106,19 @@ keyed by `(kind, otid)` and chunks append; a different otid or kind starts a
 new block. There is no delta-vs-completed-message dedup: this SDK sends one or
 the other, never both for the same content.
 
+## Sessions are cached per conversation
+
+Opening a session is the expensive part of a turn — a subprocess spawn for the
+local backend, a websocket connect plus runtime handshake for remote/cloud —
+and the SDK is built around one long-lived session per conversation. The
+provider keeps a `SessionPool`: one session per agent/conversation key, shared
+by every model created from the same provider, with turns on one key
+serialised. A session whose transport throws is evicted so the next turn
+reconnects. `provider.close()` (or `await using`) disposes them all.
+
+Token usage is read from the server's `usage_statistics` stream event, which
+arrives before `result`.
+
 ## Abort and cancel
 
 The caller's `abortSignal` is chained into a provider-owned `AbortController`
@@ -174,10 +187,10 @@ credentials, nothing left the machine):
   execution itself *does* work: pass Letta `AgentTool`s through
   `providerOptions.letta.session.tools` and they run in your process. What is
   missing is only the automatic AI-SDK-shape → `AgentTool` conversion.
-- **Usage is unreported.** `SDKResultMessage` carries `durationMs` and
-  `totalCostUsd` but no token counts, so usage fields are `undefined`
-  (upstream hardcoded `-1`).
 - Upstream's REST-era e2e tests were removed rather than ported.
 - `loop_status` and `queue_update` messages are ignored rather than surfaced.
+- Session options (`providerOptions.letta.session`) take effect when a
+  conversation's session is first opened; later turns on the same
+  conversation reuse that session as-is.
 - `lint` and `prettier-check` remain broken upstream — neither eslint nor
   prettier is a devDependency. Left alone as out of scope.
